@@ -1,0 +1,18 @@
+{
+  "timeframe_minutes": 180,
+  "trade_direction": "Both",
+  "use_adx": true,
+  "adx_length": 14,
+  "adx_threshold": 15,
+  "fast_ema": 21,
+  "slow_ema": 50,
+  "use_sl": false,
+  "sl_percent": 0.01,
+  "use_trail": false,
+  "trail_percent": 0.015,
+  "trail_offset": 0.005,
+  "use_be": true,
+  "be_trigger_percent": 0.01,
+  "position_size_pct": 10,
+  "risk_params": {}
+}
