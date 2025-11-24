@@ -18,7 +18,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pandas as pd
-from ib_insync import (BarDataList, Contract, IB, MarketOrder, Order,
+from ib_insync import (BarDataList, Contract, IB, LimitOrder, Order,
                        RealTimeBar, Stock)
 
 from backtesting import ib_bar_size_setting
@@ -358,8 +358,9 @@ class EmaAdxBot:
             self.logger.info("Computed quantity is 0; skipping entry.")
             return
         action = "BUY" if side == "long" else "SELL"
-        self.logger.info(f"Placing {side} entry for {qty} shares at market.")
-        order = MarketOrder(action, qty, transmit=LIVE_TRADING)
+        limit_price = price
+        self.logger.info(f"Placing {side} entry for {qty} shares with limit {limit_price:.2f}.")
+        order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         trade = self.ib.placeOrder(self.contract, order)
         self.ib.sleep(1)
         if trade.orderStatus.status in {"Filled", "Submitted"}:
@@ -377,8 +378,11 @@ class EmaAdxBot:
             return
         action = "SELL" if self.position_side == "long" else "BUY"
         qty = abs(self._current_position_size())
-        self.logger.info(f"Closing {self.position_side} position of {qty} shares.")
-        order = MarketOrder(action, qty, transmit=LIVE_TRADING)
+        limit_price = self.bars[-1].close
+        self.logger.info(
+            f"Closing {self.position_side} position of {qty} shares with limit {limit_price:.2f}."
+        )
+        order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         self.ib.placeOrder(self.contract, order)
         self.stop_order = None
         self.be_triggered = False
@@ -439,9 +443,10 @@ class EmaAdxBot:
         stop_action = "SELL" if self.position_side == "long" else "BUY"
         stop_order = Order(
             action=stop_action,
-            orderType="STP",
+            orderType="STP LMT",
             totalQuantity=position_qty,
             auxPrice=stop_price,
+            lmtPrice=stop_price,
             transmit=LIVE_TRADING,
         )
         self.stop_order = stop_order
