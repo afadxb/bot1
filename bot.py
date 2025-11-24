@@ -21,7 +21,7 @@ import pandas as pd
 from ib_insync import (BarDataList, Contract, IB, LimitOrder, Order,
                        RealTimeBar, Stock)
 
-from backtesting import ib_bar_size_setting
+from data_cache import get_resampled_bars
 from config import (CLIENT_ID, CONFIG_PATH, CURRENCY, ENABLE_MARKET_HOURLY_LOOP,
                     ENABLE_WEEKLY_OPTIMIZATION, EXCHANGE, HOST, LIVE_TRADING,
                     MARKET_CLOSE_UTC, MARKET_DAYS, MARKET_OPEN_UTC,
@@ -180,27 +180,21 @@ class EmaAdxBot:
 
     def _load_initial_history(self) -> None:
         """Prefill bars using historical data to warm up indicators."""
-        hist = self.ib.reqHistoricalData(
-            self.contract,
-            endDateTime="",
-            durationStr="30 D",
-            barSizeSetting=ib_bar_size_setting(self.config.timeframe_minutes),
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-        )
-        for hbar in hist:
-            raw_time = hbar.date if isinstance(hbar.date, dt.datetime) else dt.datetime.strptime(hbar.date, "%Y%m%d %H:%M:%S")
+        hist_df = get_resampled_bars(self.config.timeframe_minutes, lookback_days=30)
+        if hist_df.empty:
+            self.logger.warning("No historical data available from cache/IB.")
+            return
+        for row in hist_df.itertuples():
             bar = Bar(
-                time=self._to_naive_utc(raw_time),
-                open=hbar.open,
-                high=hbar.high,
-                low=hbar.low,
-                close=hbar.close,
-                volume=hbar.volume,
+                time=self._to_naive_utc(row.time.to_pydatetime() if hasattr(row.time, "to_pydatetime") else row.time),
+                open=float(row.open),
+                high=float(row.high),
+                low=float(row.low),
+                close=float(row.close),
+                volume=float(row.volume),
             )
             self.bars.append(bar)
-        self.logger.info(f"Loaded {len(self.bars)} historical bars.")
+        self.logger.info(f"Loaded {len(self.bars)} historical bars from cache/IB.")
         if self.bars:
             self.current_bar = self.bars[-1]
             self.update_indicators()

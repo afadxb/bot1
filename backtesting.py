@@ -1,14 +1,12 @@
 """Backtesting and historical data utilities for the EMA+ADX bot."""
 from __future__ import annotations
 
-import datetime as dt
 import math
 from typing import Dict, Optional
 
 import pandas as pd
-from ib_insync import Contract, IB, Stock
 
-from config import CLIENT_ID, CURRENCY, EXCHANGE, HOST, PORT, SYMBOL
+from data_cache import get_resampled_bars
 
 
 def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
@@ -21,28 +19,8 @@ def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
 
 
 def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int = 120) -> pd.DataFrame:
-    """Fetch historical bars from IBKR and aggregate to timeframe."""
-    ib = IB()
-    try:
-        ib.connect(HOST, PORT, clientId=CLIENT_ID + 100, timeout=5)
-        contract: Contract = Stock(SYMBOL, EXCHANGE, CURRENCY)
-        ib.qualifyContracts(contract)
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime="",
-            durationStr=f"{lookback_days} D",
-            barSizeSetting=ib_bar_size_setting(timeframe_minutes),
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-        )
-        rows = []
-        for b in bars:
-            ts = b.date if isinstance(b.date, dt.datetime) else dt.datetime.strptime(b.date, "%Y%m%d %H:%M:%S")
-            rows.append({"time": ts, "open": b.open, "high": b.high, "low": b.low, "close": b.close, "volume": b.volume})
-        return pd.DataFrame(rows)
-    finally:
-        ib.disconnect()
+    """Fetch historical bars from cache (hourly base) and resample as needed."""
+    return get_resampled_bars(timeframe_minutes, lookback_days)
 
 
 def ib_bar_size_setting(timeframe_minutes: int) -> str:
