@@ -28,10 +28,10 @@ except Exception:  # pragma: no cover - optional dependency
 # Configuration constants
 # -------------------------
 HOST = "127.0.0.1"
-PORT = 7497  # 7497 for paper, 7496 for live
+PORT = 4002  # 7497 for paper, 7496 for live
 CLIENT_ID = 10
 
-SYMBOL = "AAPL"
+SYMBOL = "TSLA"
 EXCHANGE = "SMART"
 CURRENCY = "USD"
 
