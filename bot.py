@@ -19,11 +19,6 @@ import pandas as pd
 from ib_insync import (BarDataList, Contract, IB, MarketOrder, Order,
                        RealTimeBar, Stock)
 
-try:  # Optional fallback for historical data
-    import yfinance as yf
-except Exception:  # pragma: no cover - optional dependency
-    yf = None
-
 # -------------------------
 # Configuration constants
 # -------------------------
@@ -43,6 +38,10 @@ ENABLE_WEEKLY_OPTIMIZATION = True
 WEEKLY_OPTIMIZATION_DAY = 6  # Sunday (0=Monday ... 6=Sunday)
 WEEKLY_OPTIMIZATION_HOUR = 20  # 8pm UTC by default
 CONFIG_PATH = "ema_adx_config.json"
+ENABLE_MARKET_HOURLY_LOOP = True
+MARKET_OPEN_UTC = dt.time(13, 30)  # 9:30 AM ET
+MARKET_CLOSE_UTC = dt.time(20, 0)  # 4:00 PM ET
+MARKET_DAYS = {0, 1, 2, 3, 4}  # Monday-Friday
 
 
 @dataclass
@@ -121,9 +120,9 @@ class EmaAdxBot:
         self.high_since_entry: Optional[float] = None
         self.low_since_entry: Optional[float] = None
         self.config = config
-        self.pause_trading = False
-        self._scheduler_thread: Optional[threading.Thread] = None
+        self._maintenance_thread: Optional[threading.Thread] = None
         self._last_optimization_date: Optional[dt.date] = None
+        self._last_hourly_tick: Optional[dt.datetime] = None
 
     # -------------------------
     # Connection helpers
@@ -150,9 +149,9 @@ class EmaAdxBot:
         self.ib.qualifyContracts(self.contract)
         self._load_initial_history()
 
-        if ENABLE_WEEKLY_OPTIMIZATION:
-            self._scheduler_thread = threading.Thread(target=self._weekly_scheduler, daemon=True)
-            self._scheduler_thread.start()
+        if ENABLE_WEEKLY_OPTIMIZATION or ENABLE_MARKET_HOURLY_LOOP:
+            self._maintenance_thread = threading.Thread(target=self._maintenance_loop, daemon=True)
+            self._maintenance_thread.start()
 
         rt_bars: BarDataList = self.ib.reqRealTimeBars(
             self.contract,
@@ -165,11 +164,12 @@ class EmaAdxBot:
         print("Subscribed to real-time bars. Running event loop...")
         self.ib.run()
 
-    def _weekly_scheduler(self) -> None:
-        """Run weekly optimization on the configured day/hour."""
+    def _maintenance_loop(self) -> None:
+        """Simple loop to coordinate weekly optimization and hourly market heartbeats."""
         while True:
             now = dt.datetime.utcnow()
-            if (
+
+            if ENABLE_WEEKLY_OPTIMIZATION and (
                 now.weekday() == WEEKLY_OPTIMIZATION_DAY
                 and now.hour == WEEKLY_OPTIMIZATION_HOUR
                 and (self._last_optimization_date is None or self._last_optimization_date != now.date())
@@ -180,7 +180,21 @@ class EmaAdxBot:
                     self.run_weekly_optimization()
                 except Exception as exc:  # pragma: no cover - runtime safety
                     print(f"Weekly optimization failed: {exc}")
-            time.sleep(60)
+
+            if ENABLE_MARKET_HOURLY_LOOP and (
+                now.weekday() in MARKET_DAYS
+                and MARKET_OPEN_UTC <= now.time() <= MARKET_CLOSE_UTC
+                and (self._last_hourly_tick is None or now.hour != self._last_hourly_tick.hour)
+                and now.minute == 0
+            ):
+                self._last_hourly_tick = now.replace(minute=0, second=0, microsecond=0)
+                status = "connected" if self.ib.isConnected() else "disconnected"
+                print(
+                    f"[HOURLY] Market session heartbeat at {now.isoformat()} UTC. "
+                    f"Trading loop is {status}."
+                )
+
+            time.sleep(30)
 
     def _load_initial_history(self) -> None:
         """Prefill bars using historical data to warm up indicators."""
@@ -309,10 +323,6 @@ class EmaAdxBot:
 
         self._refresh_position_state()
 
-        if self.pause_trading:
-            print("Trading paused during optimization.")
-            return
-
         # Reverse exits
         if self.position_side == "long" and ema_crossunder:
             print("EMA reverse exit triggered for long.")
@@ -438,7 +448,6 @@ class EmaAdxBot:
     # -------------------------
     def run_weekly_optimization(self) -> None:
         """Perform weekly grid search and apply the best configuration."""
-        self.pause_trading = True
         timeframes = [60, 120, 180, 240]
         fast_opts = [10, 14, 21, 34]
         slow_opts = [34, 50, 89, 100]
@@ -448,7 +457,7 @@ class EmaAdxBot:
         print("Fetching historical data for optimization...")
         bars_cache: Dict[int, pd.DataFrame] = {}
         for tf in timeframes:
-            bars_cache[tf] = fetch_historical_dataframe(tf, use_ibkr=yf is None)
+            bars_cache[tf] = fetch_historical_dataframe(tf)
 
         best_config: Optional[StrategyConfig] = None
         best_metrics: Optional[Dict[str, float]] = None
@@ -505,8 +514,6 @@ class EmaAdxBot:
                 print("Best configuration matches current settings.")
         else:
             print("Optimization did not find a valid configuration.")
-
-        self.pause_trading = False
 
     def apply_new_config(self, config: StrategyConfig) -> None:
         """Reload bars and indicators using the optimized configuration."""
@@ -585,19 +592,8 @@ def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
     return metrics["sharpe"] > incumbent["sharpe"]
 
 
-def fetch_historical_dataframe(timeframe_minutes: int, use_ibkr: bool = True, lookback_days: int = 120) -> pd.DataFrame:
-    """Fetch historical bars from IBKR or yfinance and aggregate to timeframe."""
-    if not use_ibkr and yf is not None:
-        ticker = yf.Ticker(SYMBOL)
-        interval = "60m" if timeframe_minutes == 60 else f"{timeframe_minutes}m"
-        hist = ticker.history(period=f"{lookback_days}d", interval=interval)
-        if hist.empty:
-            return pd.DataFrame()
-        hist = hist.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        hist.reset_index(inplace=True)
-        hist.rename(columns={"Datetime": "time"}, inplace=True)
-        return hist[["time", "open", "high", "low", "close", "volume"]]
-
+def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int = 120) -> pd.DataFrame:
+    """Fetch historical bars from IBKR and aggregate to timeframe."""
     ib = IB()
     try:
         ib.connect(HOST, PORT, clientId=CLIENT_ID + 100, timeout=5)
