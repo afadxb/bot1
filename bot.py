@@ -120,8 +120,7 @@ class EmaAdxBot:
         self.high_since_entry: Optional[float] = None
         self.low_since_entry: Optional[float] = None
         self.config = config
-        self._scheduler_thread: Optional[threading.Thread] = None
-        self._hourly_thread: Optional[threading.Thread] = None
+        self._maintenance_thread: Optional[threading.Thread] = None
         self._last_optimization_date: Optional[dt.date] = None
         self._last_hourly_tick: Optional[dt.datetime] = None
 
@@ -150,9 +149,9 @@ class EmaAdxBot:
         self.ib.qualifyContracts(self.contract)
         self._load_initial_history()
 
-        if ENABLE_WEEKLY_OPTIMIZATION:
-            self._scheduler_thread = threading.Thread(target=self._weekly_scheduler, daemon=True)
-            self._scheduler_thread.start()
+        if ENABLE_WEEKLY_OPTIMIZATION or ENABLE_MARKET_HOURLY_LOOP:
+            self._maintenance_thread = threading.Thread(target=self._maintenance_loop, daemon=True)
+            self._maintenance_thread.start()
 
         if ENABLE_MARKET_HOURLY_LOOP:
             self._hourly_thread = threading.Thread(target=self._hourly_market_loop, daemon=True)
@@ -169,11 +168,12 @@ class EmaAdxBot:
         print("Subscribed to real-time bars. Running event loop...")
         self.ib.run()
 
-    def _weekly_scheduler(self) -> None:
-        """Run weekly optimization on the configured day/hour."""
+    def _maintenance_loop(self) -> None:
+        """Simple loop to coordinate weekly optimization and hourly market heartbeats."""
         while True:
             now = dt.datetime.utcnow()
-            if (
+
+            if ENABLE_WEEKLY_OPTIMIZATION and (
                 now.weekday() == WEEKLY_OPTIMIZATION_DAY
                 and now.hour == WEEKLY_OPTIMIZATION_HOUR
                 and (self._last_optimization_date is None or self._last_optimization_date != now.date())
@@ -184,7 +184,21 @@ class EmaAdxBot:
                     self.run_weekly_optimization()
                 except Exception as exc:  # pragma: no cover - runtime safety
                     print(f"Weekly optimization failed: {exc}")
-            time.sleep(60)
+
+            if ENABLE_MARKET_HOURLY_LOOP and (
+                now.weekday() in MARKET_DAYS
+                and MARKET_OPEN_UTC <= now.time() <= MARKET_CLOSE_UTC
+                and (self._last_hourly_tick is None or now.hour != self._last_hourly_tick.hour)
+                and now.minute == 0
+            ):
+                self._last_hourly_tick = now.replace(minute=0, second=0, microsecond=0)
+                status = "connected" if self.ib.isConnected() else "disconnected"
+                print(
+                    f"[HOURLY] Market session heartbeat at {now.isoformat()} UTC. "
+                    f"Trading loop is {status}."
+                )
+
+            time.sleep(30)
 
     def _hourly_market_loop(self) -> None:
         """Emit an hourly heartbeat during market hours to confirm the trading loop is active."""
