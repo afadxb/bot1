@@ -153,6 +153,10 @@ class EmaAdxBot:
             self._maintenance_thread = threading.Thread(target=self._maintenance_loop, daemon=True)
             self._maintenance_thread.start()
 
+        if ENABLE_MARKET_HOURLY_LOOP:
+            self._hourly_thread = threading.Thread(target=self._hourly_market_loop, daemon=True)
+            self._hourly_thread.start()
+
         rt_bars: BarDataList = self.ib.reqRealTimeBars(
             self.contract,
             barSize=5,
@@ -194,6 +198,24 @@ class EmaAdxBot:
                     f"Trading loop is {status}."
                 )
 
+            time.sleep(30)
+
+    def _hourly_market_loop(self) -> None:
+        """Emit an hourly heartbeat during market hours to confirm the trading loop is active."""
+        while True:
+            now = dt.datetime.utcnow()
+            if (
+                now.weekday() in MARKET_DAYS
+                and MARKET_OPEN_UTC <= now.time() <= MARKET_CLOSE_UTC
+                and (self._last_hourly_tick is None or now.hour != self._last_hourly_tick.hour)
+                and now.minute == 0
+            ):
+                self._last_hourly_tick = now.replace(minute=0, second=0, microsecond=0)
+                status = "connected" if self.ib.isConnected() else "disconnected"
+                print(
+                    f"[HOURLY] Market session heartbeat at {now.isoformat()} UTC. "
+                    f"Trading loop is {status}."
+                )
             time.sleep(30)
 
     def _load_initial_history(self) -> None:
