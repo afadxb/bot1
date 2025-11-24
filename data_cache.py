@@ -14,6 +14,12 @@ from config import CLIENT_ID, CURRENCY, EXCHANGE, HOST, PORT, SYMBOL
 CACHE_TTL = dt.timedelta(hours=1)
 DB_PATH = Path("data_cache.sqlite")
 
+def _to_naive_utc(ts: dt.datetime) -> dt.datetime:
+    """Normalize timestamps to naive UTC for consistent storage/processing."""
+    if ts.tzinfo:
+        return ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return ts.replace(tzinfo=None)
+
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -82,8 +88,9 @@ def _read_cached_bars(timeframe_minutes: int) -> Optional[pd.DataFrame]:
             """,
             conn,
             params=key,
-            parse_dates=["time"],
         )
+        if not df.empty:
+            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
         return df
 
 
@@ -148,7 +155,8 @@ def _fetch_hourly_from_ib(lookback_days: int) -> pd.DataFrame:
         )
         rows = []
         for b in bars:
-            ts = b.date if isinstance(b.date, dt.datetime) else dt.datetime.strptime(b.date, "%Y%m%d %H:%M:%S")
+            raw_ts = b.date if isinstance(b.date, dt.datetime) else dt.datetime.strptime(b.date, "%Y%m%d %H:%M:%S")
+            ts = _to_naive_utc(raw_ts)
             rows.append(
                 {
                     "time": ts,
@@ -175,7 +183,7 @@ def _hourly_dataframe(lookback_days: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     if not base_df.empty:
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)
+        cutoff = (pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).tz_localize(None)
         base_df = base_df[base_df["time"] >= cutoff]
     return base_df
 
@@ -184,7 +192,7 @@ def _resample_dataframe(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFram
     if df.empty:
         return df
     indexed = df.copy()
-    indexed["time"] = pd.to_datetime(indexed["time"])
+    indexed["time"] = pd.to_datetime(indexed["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
     indexed = indexed.sort_values("time").set_index("time")
     rule = f"{timeframe_minutes}T"
     agg = indexed.resample(rule, label="left", closed="left").agg(

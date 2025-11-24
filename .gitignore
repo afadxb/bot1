@@ -6,6 +6,7 @@ logs/*
 # C extensions
 *.so
 *.json
+*.sqlite
 
 # Distribution / packaging
 .Python
