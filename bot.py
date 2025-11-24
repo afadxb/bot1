@@ -506,7 +506,7 @@ class EmaAdxBot:
 
 
 # -------------------------
-# Script entry point
+# Script entry point 
 # -------------------------
 def run_bot() -> None:
     config = load_config()
