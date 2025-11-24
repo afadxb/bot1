@@ -8,81 +8,23 @@ all parameters before enabling LIVE_TRADING.
 from __future__ import annotations
 
 import datetime as dt
-import json
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from ib_insync import (BarDataList, Contract, IB, MarketOrder, Order,
                        RealTimeBar, Stock)
 
-# -------------------------
-# Configuration constants
-# -------------------------
-HOST = "127.0.0.1"
-PORT = 4002  # 7497 for paper, 7496 for live
-CLIENT_ID = 10
-
-SYMBOL = "TSLA"
-EXCHANGE = "SMART"
-CURRENCY = "USD"
-
-DEFAULT_TIMEFRAME_MINUTES = 180  # 3-hour default for live trading
-MIN_HISTORY_BARS = 100  # to warm up indicators
-
-LIVE_TRADING = False  # Set to True to actually transmit orders
-ENABLE_WEEKLY_OPTIMIZATION = True
-WEEKLY_OPTIMIZATION_DAY = 6  # Sunday (0=Monday ... 6=Sunday)
-WEEKLY_OPTIMIZATION_HOUR = 20  # 8pm UTC by default
-CONFIG_PATH = "ema_adx_config.json"
-ENABLE_MARKET_HOURLY_LOOP = True
-MARKET_OPEN_UTC = dt.time(13, 30)  # 9:30 AM ET
-MARKET_CLOSE_UTC = dt.time(20, 0)  # 4:00 PM ET
-MARKET_DAYS = {0, 1, 2, 3, 4}  # Monday-Friday
-
-
-@dataclass
-class StrategyConfig:
-    """Runtime configuration loaded from disk or defaults."""
-
-    timeframe_minutes: int = DEFAULT_TIMEFRAME_MINUTES
-    trade_direction: str = "Both"
-    use_adx: bool = True
-    adx_length: int = 14
-    adx_threshold: int = 15
-    fast_ema: int = 21
-    slow_ema: int = 50
-    use_sl: bool = False
-    sl_percent: float = 0.01
-    use_trail: bool = False
-    trail_percent: float = 0.015
-    trail_offset: float = 0.005
-    use_be: bool = True
-    be_trigger_percent: float = 0.01
-    position_size_pct: float = 10
-    risk_params: Dict[str, float] = field(default_factory=dict)
-
-
-def load_config(path: str = CONFIG_PATH) -> StrategyConfig:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        print(f"Loaded configuration from {path}.")
-        return StrategyConfig(**data)
-    except FileNotFoundError:
-        print("No existing configuration found; using defaults.")
-    except Exception as exc:  # pragma: no cover - user file errors
-        print(f"Failed to load configuration: {exc}. Using defaults.")
-    return StrategyConfig()
-
-
-def save_config(config: StrategyConfig, path: str = CONFIG_PATH) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config.__dict__, f, indent=2)
-    print(f"Saved configuration to {path}.")
+from backtesting import ib_bar_size_setting
+from config import (CLIENT_ID, CONFIG_PATH, CURRENCY, ENABLE_MARKET_HOURLY_LOOP,
+                    ENABLE_WEEKLY_OPTIMIZATION, EXCHANGE, HOST, LIVE_TRADING,
+                    MARKET_CLOSE_UTC, MARKET_DAYS, MARKET_OPEN_UTC,
+                    MIN_HISTORY_BARS, PORT, SYMBOL, StrategyConfig, load_config,
+                    save_config)
+from weekly_optimization import print_top_results, run_weekly_optimization_once
 
 
 @dataclass
@@ -224,7 +166,7 @@ class EmaAdxBot:
             self.contract,
             endDateTime="",
             durationStr="30 D",
-            barSizeSetting=_ib_bar_size_setting(self.config.timeframe_minutes),
+            barSizeSetting=ib_bar_size_setting(self.config.timeframe_minutes),
             whatToShow="TRADES",
             useRTH=True,
             formatDate=1,
@@ -470,62 +412,11 @@ class EmaAdxBot:
     # -------------------------
     def run_weekly_optimization(self) -> None:
         """Perform weekly grid search and apply the best configuration."""
-        timeframes = [60, 120, 180, 240]
-        fast_opts = [10, 14, 21, 34]
-        slow_opts = [34, 50, 89, 100]
-        adx_len_opts = [14, 20]
-        adx_thresh_opts = [10, 15, 20, 25]
-
-        print("Fetching historical data for optimization...")
-        bars_cache: Dict[int, pd.DataFrame] = {}
-        for tf in timeframes:
-            bars_cache[tf] = fetch_historical_dataframe(tf)
-
-        best_config: Optional[StrategyConfig] = None
-        best_metrics: Optional[Dict[str, float]] = None
-        results: List[Tuple[StrategyConfig, Dict[str, float]]] = []
-
-        for tf in timeframes:
-            df = bars_cache.get(tf)
-            if df is None or df.empty:
-                continue
-            for fast in fast_opts:
-                for slow in slow_opts:
-                    if fast >= slow:
-                        continue
-                    for adx_len in adx_len_opts:
-                        for adx_thresh in adx_thresh_opts:
-                            params = StrategyConfig(
-                                timeframe_minutes=tf,
-                                fast_ema=fast,
-                                slow_ema=slow,
-                                adx_length=adx_len,
-                                adx_threshold=adx_thresh,
-                                use_adx=True,
-                                trade_direction="Both",
-                                use_sl=self.config.use_sl,
-                                sl_percent=self.config.sl_percent,
-                                use_trail=self.config.use_trail,
-                                trail_percent=self.config.trail_percent,
-                                trail_offset=self.config.trail_offset,
-                                use_be=self.config.use_be,
-                                be_trigger_percent=self.config.be_trigger_percent,
-                                position_size_pct=self.config.position_size_pct,
-                            )
-                            metrics = backtest_strategy(df, params)
-                            results.append((params, metrics))
-                            if best_metrics is None or rank_better(metrics, best_metrics):
-                                best_metrics = metrics
-                                best_config = params
+        best_config, best_metrics, results = run_weekly_optimization_once(self.config)
 
         if best_config and best_metrics:
             print("Optimization results (top 5):")
-            for params, metrics in sorted(results, key=lambda x: (-x[1]["net_pnl"], x[1]["max_drawdown"], -x[1]["sharpe"]))[:5]:
-                print(
-                    f"TF={params.timeframe_minutes}m, Fast={params.fast_ema}, Slow={params.slow_ema}, "
-                    f"ADX={params.adx_length}/{params.adx_threshold} -> PnL={metrics['net_pnl']:.2f}, "
-                    f"DD={metrics['max_drawdown']:.2f}, Sharpe={metrics['sharpe']:.2f}, Trades={metrics['trades']}"
-                )
+            print_top_results(results)
 
             save_config(best_config)
             if best_config.__dict__ != self.config.__dict__:
@@ -600,197 +491,6 @@ class EmaAdxBot:
             ):
                 return pos.position
         return 0.0
-
-
-# -------------------------
-# Backtesting helpers
-# -------------------------
-def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
-    """Return True if metrics outrank incumbent based on PnL, drawdown, Sharpe."""
-    if metrics["net_pnl"] != incumbent["net_pnl"]:
-        return metrics["net_pnl"] > incumbent["net_pnl"]
-    if metrics["max_drawdown"] != incumbent["max_drawdown"]:
-        return metrics["max_drawdown"] < incumbent["max_drawdown"]
-    return metrics["sharpe"] > incumbent["sharpe"]
-
-
-def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int = 120) -> pd.DataFrame:
-    """Fetch historical bars from IBKR and aggregate to timeframe."""
-    ib = IB()
-    try:
-        ib.connect(HOST, PORT, clientId=CLIENT_ID + 100, timeout=5)
-        contract: Contract = Stock(SYMBOL, EXCHANGE, CURRENCY)
-        ib.qualifyContracts(contract)
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime="",
-            durationStr=f"{lookback_days} D",
-            barSizeSetting=_ib_bar_size_setting(timeframe_minutes),
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-        )
-        rows = []
-        for b in bars:
-            ts = b.date if isinstance(b.date, dt.datetime) else dt.datetime.strptime(b.date, "%Y%m%d %H:%M:%S")
-            rows.append({"time": ts, "open": b.open, "high": b.high, "low": b.low, "close": b.close, "volume": b.volume})
-        return pd.DataFrame(rows)
-    finally:
-        ib.disconnect()
-
-
-def _ib_bar_size_setting(timeframe_minutes: int) -> str:
-    """Map timeframe minutes to an IB-compatible barSizeSetting string."""
-    if timeframe_minutes % 60 == 0:
-        hours = timeframe_minutes // 60
-        return f"{hours} hour" if hours == 1 else f"{hours} hours"
-    return f"{timeframe_minutes} mins"
-
-
-def _compute_adx_series(df: pd.DataFrame, length: int) -> pd.Series:
-    highs = df["high"]
-    lows = df["low"]
-    closes = df["close"]
-    up_move = highs.diff()
-    down_move = lows.shift(1) - lows
-    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-    tr = pd.concat([
-        highs - lows,
-        (highs - closes.shift()).abs(),
-        (lows - closes.shift()).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr)
-    dx = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di).abs()) * 100
-    adx = dx.ewm(alpha=1 / length, adjust=False).mean()
-    return adx.fillna(0)
-
-
-def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, float]:
-    """Simulate strategy over historical bars using given parameters."""
-    if df.empty:
-        return {"net_pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "trades": 0}
-
-    df = df.copy()
-    df["fast"] = df["close"].ewm(span=params.fast_ema, adjust=False).mean()
-    df["slow"] = df["close"].ewm(span=params.slow_ema, adjust=False).mean()
-    df["fast_prev"] = df["fast"].shift(1)
-    df["slow_prev"] = df["slow"].shift(1)
-    df["adx"] = _compute_adx_series(df, params.adx_length)
-
-    position = 0  # +1 long, -1 short
-    entry_price = 0.0
-    be_triggered = False
-    stop_price: Optional[float] = None
-    high_since_entry: Optional[float] = None
-    low_since_entry: Optional[float] = None
-    cash = 0.0
-    equity_curve = []
-    trades = 0
-
-    for _, row in df.iterrows():
-        fast = row.fast
-        slow = row.slow
-        prev_fast = row.fast_prev
-        prev_slow = row.slow_prev
-        adx_val = row.adx
-        price = row.close
-        high = row.high
-        low = row.low
-
-        ema_crossover = prev_fast <= prev_slow and fast > slow
-        ema_crossunder = prev_fast >= prev_slow and fast < slow
-        adx_condition = adx_val > params.adx_threshold if params.use_adx else True
-
-        # Risk management updates
-        if position != 0:
-            if position > 0:
-                high_since_entry = max(high_since_entry or price, high)
-                if params.use_be and high_since_entry > entry_price * (1 + params.be_trigger_percent):
-                    be_triggered = True
-                base_stop = entry_price * (1 - params.sl_percent) if params.use_sl else None
-                if be_triggered:
-                    base_stop = max(base_stop or 0, entry_price)
-                trail_candidate = None
-                if params.use_trail and price > entry_price * (1 + params.trail_offset):
-                    trail_candidate = price - entry_price * params.trail_percent
-                stop_price = max(v for v in [base_stop, trail_candidate] if v is not None) if any(
-                    v is not None for v in [base_stop, trail_candidate]
-                ) else stop_price
-                if stop_price and low <= stop_price:
-                    cash += (stop_price - entry_price)
-                    position = 0
-                    trades += 1
-                    stop_price = None
-            else:  # short
-                low_since_entry = min(low_since_entry or price, low)
-                if params.use_be and low_since_entry < entry_price * (1 - params.be_trigger_percent):
-                    be_triggered = True
-                base_stop = entry_price * (1 + params.sl_percent) if params.use_sl else None
-                if be_triggered:
-                    base_stop = min(base_stop or float("inf"), entry_price)
-                trail_candidate = None
-                if params.use_trail and price < entry_price * (1 - params.trail_offset):
-                    trail_candidate = price + entry_price * params.trail_percent
-                stop_price = min(v for v in [base_stop, trail_candidate] if v is not None) if any(
-                    v is not None for v in [base_stop, trail_candidate]
-                ) else stop_price
-                if stop_price and high >= stop_price:
-                    cash += (entry_price - stop_price)
-                    position = 0
-                    trades += 1
-                    stop_price = None
-
-        # Reverse exits
-        if position > 0 and ema_crossunder:
-            cash += (price - entry_price)
-            position = 0
-            trades += 1
-            stop_price = None
-        elif position < 0 and ema_crossover:
-            cash += (entry_price - price)
-            position = 0
-            trades += 1
-            stop_price = None
-
-        # Entries
-        if position <= 0 and ema_crossover and adx_condition and params.trade_direction in ("Long", "Both"):
-            position = 1
-            entry_price = price
-            be_triggered = False
-            high_since_entry = price
-            low_since_entry = price
-            stop_price = None
-        elif position >= 0 and ema_crossunder and adx_condition and params.trade_direction in ("Short", "Both"):
-            position = -1
-            entry_price = price
-            be_triggered = False
-            high_since_entry = price
-            low_since_entry = price
-            stop_price = None
-
-        equity_curve.append(cash + position * price)
-
-    if not equity_curve:
-        return {"net_pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "trades": 0}
-
-    equity_series = pd.Series(equity_curve)
-    net_pnl = equity_series.iloc[-1]
-    peak = equity_series.cummax()
-    drawdown = (equity_series - peak).min()
-    returns = equity_series.diff().fillna(0)
-    if returns.std() > 0:
-        sharpe = returns.mean() / returns.std() * math.sqrt(252)
-    else:
-        sharpe = 0.0
-    return {
-        "net_pnl": float(net_pnl),
-        "max_drawdown": float(drawdown),
-        "sharpe": float(sharpe),
-        "trades": trades,
-    }
 
 
 # -------------------------
