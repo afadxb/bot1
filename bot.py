@@ -1,5 +1,5 @@
 """
-EMA Cross + ADX Filter trading bot for Interactive Brokers (IBKR).
+EMA Cross + ADX Filter trading bot for Interactive Brokers (IBKR). 
 
 This script recreates the provided TradingView Pine Script strategy using the
 ib_insync library. It is intended for educational / paper-trading use. Review
