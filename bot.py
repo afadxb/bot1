@@ -188,7 +188,7 @@ class EmaAdxBot:
             self.contract,
             endDateTime="",
             durationStr="30 D",
-            barSizeSetting=f"{self.config.timeframe_minutes} mins",
+            barSizeSetting=_ib_bar_size_setting(self.config.timeframe_minutes),
             whatToShow="TRADES",
             useRTH=True,
             formatDate=1,
@@ -607,7 +607,7 @@ def fetch_historical_dataframe(timeframe_minutes: int, use_ibkr: bool = True, lo
             contract,
             endDateTime="",
             durationStr=f"{lookback_days} D",
-            barSizeSetting=f"{timeframe_minutes} mins",
+            barSizeSetting=_ib_bar_size_setting(timeframe_minutes),
             whatToShow="TRADES",
             useRTH=True,
             formatDate=1,
@@ -619,6 +619,14 @@ def fetch_historical_dataframe(timeframe_minutes: int, use_ibkr: bool = True, lo
         return pd.DataFrame(rows)
     finally:
         ib.disconnect()
+
+
+def _ib_bar_size_setting(timeframe_minutes: int) -> str:
+    """Map timeframe minutes to an IB-compatible barSizeSetting string."""
+    if timeframe_minutes % 60 == 0:
+        hours = timeframe_minutes // 60
+        return f"{hours} hour" if hours == 1 else f"{hours} hours"
+    return f"{timeframe_minutes} mins"
 
 
 def _compute_adx_series(df: pd.DataFrame, length: int) -> pd.Series:
