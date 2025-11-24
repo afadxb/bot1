@@ -18,10 +18,10 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pandas as pd
-from ib_insync import (BarDataList, Contract, IB, MarketOrder, Order,
+from ib_insync import (BarDataList, Contract, IB, LimitOrder, Order,
                        RealTimeBar, Stock)
 
-from backtesting import ib_bar_size_setting
+from data_cache import get_resampled_bars
 from config import (CLIENT_ID, CONFIG_PATH, CURRENCY, ENABLE_MARKET_HOURLY_LOOP,
                     ENABLE_WEEKLY_OPTIMIZATION, EXCHANGE, HOST, LIVE_TRADING,
                     MARKET_CLOSE_UTC, MARKET_DAYS, MARKET_OPEN_UTC,
@@ -180,27 +180,21 @@ class EmaAdxBot:
 
     def _load_initial_history(self) -> None:
         """Prefill bars using historical data to warm up indicators."""
-        hist = self.ib.reqHistoricalData(
-            self.contract,
-            endDateTime="",
-            durationStr="30 D",
-            barSizeSetting=ib_bar_size_setting(self.config.timeframe_minutes),
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-        )
-        for hbar in hist:
-            raw_time = hbar.date if isinstance(hbar.date, dt.datetime) else dt.datetime.strptime(hbar.date, "%Y%m%d %H:%M:%S")
+        hist_df = get_resampled_bars(self.config.timeframe_minutes, lookback_days=30)
+        if hist_df.empty:
+            self.logger.warning("No historical data available from cache/IB.")
+            return
+        for row in hist_df.itertuples():
             bar = Bar(
-                time=self._to_naive_utc(raw_time),
-                open=hbar.open,
-                high=hbar.high,
-                low=hbar.low,
-                close=hbar.close,
-                volume=hbar.volume,
+                time=self._to_naive_utc(row.time.to_pydatetime() if hasattr(row.time, "to_pydatetime") else row.time),
+                open=float(row.open),
+                high=float(row.high),
+                low=float(row.low),
+                close=float(row.close),
+                volume=float(row.volume),
             )
             self.bars.append(bar)
-        self.logger.info(f"Loaded {len(self.bars)} historical bars.")
+        self.logger.info(f"Loaded {len(self.bars)} historical bars from cache/IB.")
         if self.bars:
             self.current_bar = self.bars[-1]
             self.update_indicators()
@@ -358,8 +352,9 @@ class EmaAdxBot:
             self.logger.info("Computed quantity is 0; skipping entry.")
             return
         action = "BUY" if side == "long" else "SELL"
-        self.logger.info(f"Placing {side} entry for {qty} shares at market.")
-        order = MarketOrder(action, qty, transmit=LIVE_TRADING)
+        limit_price = price
+        self.logger.info(f"Placing {side} entry for {qty} shares with limit {limit_price:.2f}.")
+        order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         trade = self.ib.placeOrder(self.contract, order)
         self.ib.sleep(1)
         if trade.orderStatus.status in {"Filled", "Submitted"}:
@@ -377,8 +372,11 @@ class EmaAdxBot:
             return
         action = "SELL" if self.position_side == "long" else "BUY"
         qty = abs(self._current_position_size())
-        self.logger.info(f"Closing {self.position_side} position of {qty} shares.")
-        order = MarketOrder(action, qty, transmit=LIVE_TRADING)
+        limit_price = self.bars[-1].close
+        self.logger.info(
+            f"Closing {self.position_side} position of {qty} shares with limit {limit_price:.2f}."
+        )
+        order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         self.ib.placeOrder(self.contract, order)
         self.stop_order = None
         self.be_triggered = False
@@ -439,9 +437,10 @@ class EmaAdxBot:
         stop_action = "SELL" if self.position_side == "long" else "BUY"
         stop_order = Order(
             action=stop_action,
-            orderType="STP",
+            orderType="STP LMT",
             totalQuantity=position_qty,
             auxPrice=stop_price,
+            lmtPrice=stop_price,
             transmit=LIVE_TRADING,
         )
         self.stop_order = stop_order
