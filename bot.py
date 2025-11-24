@@ -22,7 +22,8 @@ from backtesting import ib_bar_size_setting
 from config import (CLIENT_ID, CONFIG_PATH, CURRENCY, ENABLE_MARKET_HOURLY_LOOP,
                     ENABLE_WEEKLY_OPTIMIZATION, EXCHANGE, HOST, LIVE_TRADING,
                     MARKET_CLOSE_UTC, MARKET_DAYS, MARKET_OPEN_UTC,
-                    MIN_HISTORY_BARS, PORT, SYMBOL, StrategyConfig, load_config,
+                    MIN_HISTORY_BARS, PORT, SYMBOL, WEEKLY_OPTIMIZATION_DAY,
+                    WEEKLY_OPTIMIZATION_HOUR, StrategyConfig, load_config,
                     save_config)
 from weekly_optimization import print_top_results, run_weekly_optimization_once
 
@@ -187,9 +188,20 @@ class EmaAdxBot:
             self.update_indicators()
             self._refresh_position_state()
 
-    def on_realtime_bar(self, bar: RealTimeBar, has_new_bar: bool) -> None:
+    def on_realtime_bar(self, bars: BarDataList, has_new_bar: bool) -> None:
         """Aggregate IB 5-second bars into the configured timeframe bars."""
-        bar_end = dt.datetime.fromtimestamp(bar.time)
+        if not has_new_bar or not bars:
+            return
+
+        latest_bar = bars[-1]
+
+        if isinstance(latest_bar.time, dt.datetime):
+            bar_end = latest_bar.time
+            if bar_end.tzinfo:
+                bar_end = bar_end.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        else:
+            bar_end = dt.datetime.utcfromtimestamp(latest_bar.time)
+
         frame_start = self._floor_time(bar_end, self.config.timeframe_minutes)
 
         if self.current_bar is None or frame_start > self.current_bar.time:
@@ -201,18 +213,18 @@ class EmaAdxBot:
             # start a new bar
             self.current_bar = Bar(
                 time=frame_start,
-                open=bar.open,
-                high=bar.high,
-                low=bar.low,
-                close=bar.close,
-                volume=bar.volume,
+                open=latest_bar.open,
+                high=latest_bar.high,
+                low=latest_bar.low,
+                close=latest_bar.close,
+                volume=latest_bar.volume,
             )
         else:
             # update current bar
-            self.current_bar.high = max(self.current_bar.high, bar.high)
-            self.current_bar.low = min(self.current_bar.low, bar.low)
-            self.current_bar.close = bar.close
-            self.current_bar.volume += bar.volume
+            self.current_bar.high = max(self.current_bar.high, latest_bar.high)
+            self.current_bar.low = min(self.current_bar.low, latest_bar.low)
+            self.current_bar.close = latest_bar.close
+            self.current_bar.volume += latest_bar.volume
 
     def _floor_time(self, ts: dt.datetime, minutes: int) -> dt.datetime:
         discard = dt.timedelta(minutes=ts.minute % minutes, seconds=ts.second, microseconds=ts.microsecond)
