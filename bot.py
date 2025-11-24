@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import pandas as pd
 from ib_insync import (BarDataList, Contract, IB, MarketOrder, Order,
@@ -26,6 +29,8 @@ from config import (CLIENT_ID, CONFIG_PATH, CURRENCY, ENABLE_MARKET_HOURLY_LOOP,
                     WEEKLY_OPTIMIZATION_HOUR, StrategyConfig, load_config,
                     save_config)
 from weekly_optimization import print_top_results, run_weekly_optimization_once
+
+LOG_PATH = Path("logs/bot.log")
 
 
 @dataclass
@@ -66,6 +71,7 @@ class EmaAdxBot:
         self._maintenance_thread: Optional[threading.Thread] = None
         self._last_optimization_date: Optional[dt.date] = None
         self._last_hourly_tick: Optional[dt.datetime] = None
+        self.logger = logging.getLogger("ema_adx_bot")
 
     # -------------------------
     # Connection helpers
@@ -73,13 +79,13 @@ class EmaAdxBot:
     def connect(self) -> None:
         """Connect to TWS/IB Gateway with simple retry logic."""
         try:
-            print(f"Connecting to IBKR at {HOST}:{PORT} (clientId={CLIENT_ID})...")
+            self.logger.info(f"Connecting to IBKR at {HOST}:{PORT} (clientId={CLIENT_ID})...")
             self.ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=5)
             if self.ib.isConnected():
-                print("Connected to IBKR.")
+                self.logger.info("Connected to IBKR.")
         except Exception as exc:  # pragma: no cover - network errors
-            print(f"Initial connection failed: {exc}")
-            print("Retrying in 5 seconds...")
+            self.logger.warning(f"Initial connection failed: {exc}")
+            self.logger.info("Retrying in 5 seconds...")
             self.ib.sleep(5)
             self.ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=5)
 
@@ -108,7 +114,7 @@ class EmaAdxBot:
             realTimeBarsOptions=[],
         )
         rt_bars.updateEvent += self.on_realtime_bar
-        print("Subscribed to real-time bars. Running event loop...")
+        self.logger.info("Subscribed to real-time bars. Running event loop...")
         self.ib.run()
 
     def _maintenance_loop(self) -> None:
@@ -121,22 +127,17 @@ class EmaAdxBot:
                 and now.hour == WEEKLY_OPTIMIZATION_HOUR
                 and (self._last_optimization_date is None or self._last_optimization_date != now.date())
             ):
-                print("Starting weekly optimization...")
+                self.logger.info("Starting weekly optimization...")
                 self._last_optimization_date = now.date()
                 try:
                     self.run_weekly_optimization()
                 except Exception as exc:  # pragma: no cover - runtime safety
-                    print(f"Weekly optimization failed: {exc}")
+                    self.logger.exception(f"Weekly optimization failed: {exc}")
 
-            if ENABLE_MARKET_HOURLY_LOOP and (
-                now.weekday() in MARKET_DAYS
-                and MARKET_OPEN_UTC <= now.time() <= MARKET_CLOSE_UTC
-                and (self._last_hourly_tick is None or now.hour != self._last_hourly_tick.hour)
-                and now.minute == 0
-            ):
-                self._last_hourly_tick = now.replace(minute=0, second=0, microsecond=0)
+            if ENABLE_MARKET_HOURLY_LOOP and self._should_emit_hourly(now):
+                self._last_hourly_tick = now
                 status = "connected" if self.ib.isConnected() else "disconnected"
-                print(
+                self.logger.info(
                     f"[HOURLY] Market session heartbeat at {now.isoformat()} UTC. "
                     f"Trading loop is {status}."
                 )
@@ -147,19 +148,35 @@ class EmaAdxBot:
         """Emit an hourly heartbeat during market hours to confirm the trading loop is active."""
         while True:
             now = dt.datetime.utcnow()
-            if (
-                now.weekday() in MARKET_DAYS
-                and MARKET_OPEN_UTC <= now.time() <= MARKET_CLOSE_UTC
-                and (self._last_hourly_tick is None or now.hour != self._last_hourly_tick.hour)
-                and now.minute == 0
-            ):
-                self._last_hourly_tick = now.replace(minute=0, second=0, microsecond=0)
+            if self._should_emit_hourly(now):
+                self._last_hourly_tick = now
                 status = "connected" if self.ib.isConnected() else "disconnected"
-                print(
+                self.logger.info(
                     f"[HOURLY] Market session heartbeat at {now.isoformat()} UTC. "
                     f"Trading loop is {status}."
                 )
             time.sleep(30)
+
+    def _market_session_open(self, now: dt.datetime) -> bool:
+        return now.weekday() in MARKET_DAYS and MARKET_OPEN_UTC <= now.time() <= MARKET_CLOSE_UTC
+
+    def _should_emit_hourly(self, now: dt.datetime) -> bool:
+        """Emit immediately on start, then roughly every hour during market hours (no minute==0 dependency)."""
+        if not self._market_session_open(now):
+            return False
+        if self._last_hourly_tick is None:
+            return True
+        return (now - self._last_hourly_tick) >= dt.timedelta(hours=1) - dt.timedelta(seconds=5)
+
+    @staticmethod
+    def _rt_value(bar: RealTimeBar, field: str) -> float:
+        """Access RT bar fields consistently across ib_insync versions."""
+        val = getattr(bar, field, None)
+        if val is None:
+            val = getattr(bar, f"{field}_", None)
+        if val is None:
+            raise AttributeError(f"RealTimeBar missing expected field '{field}'/'{field}_'")
+        return val
 
     def _load_initial_history(self) -> None:
         """Prefill bars using historical data to warm up indicators."""
@@ -173,8 +190,9 @@ class EmaAdxBot:
             formatDate=1,
         )
         for hbar in hist:
+            raw_time = hbar.date if isinstance(hbar.date, dt.datetime) else dt.datetime.strptime(hbar.date, "%Y%m%d %H:%M:%S")
             bar = Bar(
-                time=hbar.date if isinstance(hbar.date, dt.datetime) else dt.datetime.strptime(hbar.date, "%Y%m%d %H:%M:%S"),
+                time=self._to_naive_utc(raw_time),
                 open=hbar.open,
                 high=hbar.high,
                 low=hbar.low,
@@ -182,7 +200,7 @@ class EmaAdxBot:
                 volume=hbar.volume,
             )
             self.bars.append(bar)
-        print(f"Loaded {len(self.bars)} historical bars.")
+        self.logger.info(f"Loaded {len(self.bars)} historical bars.")
         if self.bars:
             self.current_bar = self.bars[-1]
             self.update_indicators()
@@ -195,10 +213,14 @@ class EmaAdxBot:
 
         latest_bar = bars[-1]
 
+        bar_open = self._rt_value(latest_bar, "open")
+        bar_high = self._rt_value(latest_bar, "high")
+        bar_low = self._rt_value(latest_bar, "low")
+        bar_close = self._rt_value(latest_bar, "close")
+        bar_volume = self._rt_value(latest_bar, "volume")
+
         if isinstance(latest_bar.time, dt.datetime):
-            bar_end = latest_bar.time
-            if bar_end.tzinfo:
-                bar_end = bar_end.astimezone(dt.timezone.utc).replace(tzinfo=None)
+            bar_end = self._to_naive_utc(latest_bar.time)
         else:
             bar_end = dt.datetime.utcfromtimestamp(latest_bar.time)
 
@@ -208,27 +230,34 @@ class EmaAdxBot:
             if self.current_bar:
                 # Close previous bar and act on it
                 self.bars.append(self.current_bar)
-                print(f"New bar closed at {self.current_bar.time}. Close={self.current_bar.close:.2f}")
+                self.logger.info(f"New bar closed at {self.current_bar.time}. Close={self.current_bar.close:.2f}")
                 self.on_bar_close()
             # start a new bar
             self.current_bar = Bar(
                 time=frame_start,
-                open=latest_bar.open,
-                high=latest_bar.high,
-                low=latest_bar.low,
-                close=latest_bar.close,
-                volume=latest_bar.volume,
+                open=bar_open,
+                high=bar_high,
+                low=bar_low,
+                close=bar_close,
+                volume=bar_volume,
             )
         else:
             # update current bar
-            self.current_bar.high = max(self.current_bar.high, latest_bar.high)
-            self.current_bar.low = min(self.current_bar.low, latest_bar.low)
-            self.current_bar.close = latest_bar.close
-            self.current_bar.volume += latest_bar.volume
+            self.current_bar.high = max(self.current_bar.high, bar_high)
+            self.current_bar.low = min(self.current_bar.low, bar_low)
+            self.current_bar.close = bar_close
+            self.current_bar.volume += bar_volume
 
     def _floor_time(self, ts: dt.datetime, minutes: int) -> dt.datetime:
         discard = dt.timedelta(minutes=ts.minute % minutes, seconds=ts.second, microseconds=ts.microsecond)
         return ts - discard
+
+    @staticmethod
+    def _to_naive_utc(ts: dt.datetime) -> dt.datetime:
+        """Normalize datetimes to naive UTC for consistent comparisons."""
+        if ts.tzinfo:
+            return ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        return ts.replace(tzinfo=None)
 
     # -------------------------
     # Indicator calculations
@@ -280,7 +309,7 @@ class EmaAdxBot:
     # -------------------------
     def on_bar_close(self) -> None:
         if len(self.bars) < MIN_HISTORY_BARS:
-            print(f"Waiting for more history ({len(self.bars)}/{MIN_HISTORY_BARS})...")
+            self.logger.info(f"Waiting for more history ({len(self.bars)}/{MIN_HISTORY_BARS})...")
             return
         self.update_indicators()
         fast = self.indicators.fast_ema
@@ -289,7 +318,7 @@ class EmaAdxBot:
         prev_slow = self.indicators.prev_slow_ema
         adx_val = self.indicators.adx
 
-        print(
+        self.logger.info(
             f"Bar closed. Fast EMA={fast:.2f}, Slow EMA={slow:.2f}, PrevFast={prev_fast:.2f}, PrevSlow={prev_slow:.2f}, ADX={adx_val:.2f}"
         )
 
@@ -301,10 +330,10 @@ class EmaAdxBot:
 
         # Reverse exits
         if self.position_side == "long" and ema_crossunder:
-            print("EMA reverse exit triggered for long.")
+            self.logger.info("EMA reverse exit triggered for long.")
             self.close_position()
         elif self.position_side == "short" and ema_crossover:
-            print("EMA reverse exit triggered for short.")
+            self.logger.info("EMA reverse exit triggered for short.")
             self.close_position()
 
         # Entries
@@ -326,10 +355,10 @@ class EmaAdxBot:
         price = self.bars[-1].close
         qty = self._compute_position_size(price)
         if qty <= 0:
-            print("Computed quantity is 0; skipping entry.")
+            self.logger.info("Computed quantity is 0; skipping entry.")
             return
         action = "BUY" if side == "long" else "SELL"
-        print(f"Placing {side} entry for {qty} shares at market.")
+        self.logger.info(f"Placing {side} entry for {qty} shares at market.")
         order = MarketOrder(action, qty, transmit=LIVE_TRADING)
         trade = self.ib.placeOrder(self.contract, order)
         self.ib.sleep(1)
@@ -340,7 +369,7 @@ class EmaAdxBot:
             self.stop_order = None
             self.high_since_entry = price
             self.low_since_entry = price
-            print(f"Entered {side} at ~{price:.2f}. Live={LIVE_TRADING}")
+            self.logger.info(f"Entered {side} at ~{price:.2f}. Live={LIVE_TRADING}")
 
     def close_position(self) -> None:
         self._refresh_position_state()
@@ -348,7 +377,7 @@ class EmaAdxBot:
             return
         action = "SELL" if self.position_side == "long" else "BUY"
         qty = abs(self._current_position_size())
-        print(f"Closing {self.position_side} position of {qty} shares.")
+        self.logger.info(f"Closing {self.position_side} position of {qty} shares.")
         order = MarketOrder(action, qty, transmit=LIVE_TRADING)
         self.ib.placeOrder(self.contract, order)
         self.stop_order = None
@@ -404,7 +433,7 @@ class EmaAdxBot:
 
         # Cancel previous stop if exists
         if self.stop_order:
-            print("Modifying existing stop order.")
+            self.logger.info("Modifying existing stop order.")
             self.ib.cancelOrder(self.stop_order)
 
         stop_action = "SELL" if self.position_side == "long" else "BUY"
@@ -417,7 +446,7 @@ class EmaAdxBot:
         )
         self.stop_order = stop_order
         self.ib.placeOrder(self.contract, stop_order)
-        print(f"Placed/updated stop at {stop_price:.2f} for {self.position_side} position. Live={LIVE_TRADING}")
+        self.logger.info(f"Placed/updated stop at {stop_price:.2f} for {self.position_side} position. Live={LIVE_TRADING}")
 
     # -------------------------
     # Optimization & backtesting
@@ -427,23 +456,23 @@ class EmaAdxBot:
         best_config, best_metrics, results = run_weekly_optimization_once(self.config)
 
         if best_config and best_metrics:
-            print("Optimization results (top 5):")
+            self.logger.info("Optimization results (top 5):")
             print_top_results(results)
 
             save_config(best_config)
             if best_config.__dict__ != self.config.__dict__:
-                print("Best configuration differs from current; applying and sending alert.")
+                self.logger.info("Best configuration differs from current; applying and sending alert.")
                 self._send_push_notification(best_config, best_metrics)
                 self.apply_new_config(best_config)
             else:
-                print("Best configuration matches current settings.")
+                self.logger.info("Best configuration matches current settings.")
         else:
-            print("Optimization did not find a valid configuration.")
+            self.logger.info("Optimization did not find a valid configuration.")
 
     def apply_new_config(self, config: StrategyConfig) -> None:
         """Reload bars and indicators using the optimized configuration."""
         self.config = config
-        print(
+        self.logger.info(
             f"Switching to timeframe {config.timeframe_minutes}m, Fast EMA {config.fast_ema}, "
             f"Slow EMA {config.slow_ema}, ADX {config.adx_length}/{config.adx_threshold}."
         )
@@ -453,7 +482,7 @@ class EmaAdxBot:
 
     def _send_push_notification(self, config: StrategyConfig, metrics: Dict[str, float]) -> None:
         """Placeholder for push notification when config changes."""
-        print(
+        self.logger.info(
             "[PUSH] New weekly config -> "
             f"TF={config.timeframe_minutes}m, Fast={config.fast_ema}, Slow={config.slow_ema}, "
             f"ADX={config.adx_length}/{config.adx_threshold}, "
@@ -471,7 +500,7 @@ class EmaAdxBot:
                 net_liq = float(row.value)
                 break
         if net_liq <= 0:
-            print("Unable to fetch account equity; defaulting quantity to 0.")
+            self.logger.warning("Unable to fetch account equity; defaulting quantity to 0.")
             return 0
         value = net_liq * (self.config.position_size_pct / 100)
         qty = int(value // price)
@@ -508,13 +537,34 @@ class EmaAdxBot:
 # -------------------------
 # Script entry point 
 # -------------------------
+def setup_logging(log_path: Path = LOG_PATH) -> None:
+    """Configure console + rotating file logging once per process."""
+    logger = logging.getLogger()
+    if logger.handlers:
+        return
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    stream_handler = logging.StreamHandler()
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+
+    logger.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+
 def run_bot() -> None:
+    setup_logging()
     config = load_config()
     bot = EmaAdxBot(config)
     try:
         bot.start()
     except KeyboardInterrupt:
-        print("Shutting down bot...")
+        logging.info("Shutting down bot...")
     finally:
         bot.ib.disconnect()
 

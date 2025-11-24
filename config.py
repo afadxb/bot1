@@ -8,7 +8,7 @@ from typing import Dict
 
 HOST = "127.0.0.1"
 PORT = 4002  # 7497 for paper, 7496 for live
-CLIENT_ID = 10
+CLIENT_ID = 102
 
 SYMBOL = "TSLA"
 EXCHANGE = "SMART"

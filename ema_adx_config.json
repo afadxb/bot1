@@ -1,6 +1,6 @@
 {
   "timeframe_minutes": 180,
-  "trade_direction": "Both",
+  "trade_direction": "long",
   "use_adx": true,
   "adx_length": 14,
   "adx_threshold": 15,

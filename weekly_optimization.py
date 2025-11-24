@@ -70,7 +70,7 @@ def _sorted_results(results: List[Tuple[StrategyConfig, Dict[str, float]]]) -> L
     return sorted(results, key=lambda x: (-x[1]["net_pnl"], x[1]["max_drawdown"], -x[1]["sharpe"]))
 
 
-def print_top_results(results: List[Tuple[StrategyConfig, Dict[str, float]]], limit: int = 5) -> None:
+def print_top_results(results: List[Tuple[StrategyConfig, Dict[str, float]]], limit: int = 50) -> None:
     """Helper to print the top-performing parameter sets."""
     for params, metrics in _sorted_results(results)[:limit]:
         print(
@@ -88,7 +88,7 @@ def main() -> None:
     if best_config and best_metrics:
         print("Optimization results (top 5):")
         print_top_results(results)
-        save_config(best_config)
+        # save_config(best_config)
         if best_config.__dict__ != current_config.__dict__:
             print("Saved new optimized configuration.")
         else:
