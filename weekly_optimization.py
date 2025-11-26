@@ -10,10 +10,10 @@ from config import StrategyConfig, load_config, save_config
 
 
 _TIMEFRAMES = [60, 120, 180, 240]
-_FAST_OPTS = [10, 14, 21, 34]
-_SLOW_OPTS = [34, 50, 89, 100]
-_ADX_LEN_OPTS = [14, 20]
-_ADX_THRESH_OPTS = [10, 15, 20, 25]
+_FAST_OPTS = [8, 12, 21, 34]
+_SLOW_OPTS = [34, 55, 89, 144]
+_ADX_LEN_OPTS = [10, 14, 20]
+_ADX_THRESH_OPTS = [15, 20, 25, 30]
 
 
 def run_weekly_optimization_once(
@@ -56,6 +56,14 @@ def run_weekly_optimization_once(
                             use_be=current_config.use_be,
                             be_trigger_percent=current_config.be_trigger_percent,
                             position_size_pct=current_config.position_size_pct,
+                            use_atr_risk=current_config.use_atr_risk,
+                            atr_length=current_config.atr_length,
+                            atr_sl_mult=current_config.atr_sl_mult,
+                            atr_trail_mult=current_config.atr_trail_mult,
+                            atr_be_mult=current_config.atr_be_mult,
+                            use_marketable_limits=current_config.use_marketable_limits,
+                            entry_limit_offset=current_config.entry_limit_offset,
+                            exit_limit_offset=current_config.exit_limit_offset,
                         )
                         metrics = backtest_strategy(df, params)
                         results.append((params, metrics))

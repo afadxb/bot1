@@ -176,16 +176,23 @@ def _hourly_dataframe(lookback_days: int) -> pd.DataFrame:
     base_df = _read_cached_bars(60)
     if base_df is None:
         base_df = _fetch_hourly_from_ib(lookback_days)
-        if not base_df.empty:
-            _write_cached_bars(60, base_df)
 
-    if base_df is None:
+    recent_df = _fetch_hourly_from_ib(min(lookback_days, 2))
+
+    merged_df = pd.DataFrame()
+    if base_df is not None and not base_df.empty:
+        merged_df = base_df.copy()
+    if not recent_df.empty:
+        merged_df = pd.concat([merged_df, recent_df], ignore_index=True)
+    if merged_df.empty:
         return pd.DataFrame()
 
-    if not base_df.empty:
-        cutoff = (pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).tz_localize(None)
-        base_df = base_df[base_df["time"] >= cutoff]
-    return base_df
+    merged_df = merged_df.drop_duplicates(subset=["time"], keep="last").sort_values("time")
+    _write_cached_bars(60, merged_df)
+
+    cutoff = (pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).tz_localize(None)
+    merged_df = merged_df[merged_df["time"] >= cutoff]
+    return merged_df
 
 
 def _resample_dataframe(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:

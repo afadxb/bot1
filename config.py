@@ -47,6 +47,16 @@ class StrategyConfig:
     use_be: bool = True
     be_trigger_percent: float = 0.01
     position_size_pct: float = 10
+    # ATR-based risk (optional; disabled by default)
+    use_atr_risk: bool = False
+    atr_length: int = 14
+    atr_sl_mult: float = 1.5
+    atr_trail_mult: float = 1.5
+    atr_be_mult: float = 0.75
+    # Execution tweaks
+    use_marketable_limits: bool = True
+    entry_limit_offset: float = 0.05
+    exit_limit_offset: float = 0.05
     risk_params: Dict[str, float] = field(default_factory=dict)
 
 
