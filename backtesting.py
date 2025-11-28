@@ -163,7 +163,9 @@ def _open_position(state: StrategyState, price: float, side: int, config: Strate
     state.be_triggered = False
 
 
-def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, float]:
+def backtest_strategy(
+    df: pd.DataFrame, params: StrategyConfig, return_equity: bool = False
+) -> Dict[str, object]:
     """Simulate strategy over historical bars using TradingView-like semantics."""
     if df is None or df.empty:
         return {"net_pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "trades": 0}
@@ -177,6 +179,7 @@ def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, flo
 
     state = StrategyState(cash=params.initial_capital)
     equity_curve = []
+    timestamps = []
 
     for _, row in df.iterrows():
         price = float(row.close)
@@ -210,6 +213,7 @@ def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, flo
                 _open_position(state, price, -1, params, equity)
 
         equity_curve.append(state.cash + state.position_qty * price)
+        timestamps.append(row.time if "time" in row else None)
 
     if state.position_side != 0 and not df.empty:
         last_price = float(df.iloc[-1].close)
@@ -225,12 +229,18 @@ def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, flo
     drawdown = (equity_series - peak).min()
     returns = equity_series.pct_change().fillna(0)
     sharpe = returns.mean() / returns.std() * math.sqrt(252) if returns.std() > 0 else 0.0
-    return {
+    result: Dict[str, float] = {
         "net_pnl": float(net_pnl),
         "max_drawdown": float(drawdown),
         "sharpe": float(sharpe),
         "trades": state.trades,
     }
+
+    if return_equity:
+        result["equity_curve"] = equity_series.tolist()
+        result["timestamps"] = list(df["time"]) if "time" in df else timestamps
+
+    return result
 
 
 def run_basic_test() -> None:
