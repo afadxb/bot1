@@ -7,8 +7,8 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from config import StrategyConfig
-from data_cache import get_resampled_bars
+from config import CURRENCY, EXCHANGE, StrategyConfig
+from data_cache import fetch_historical_dataframe as cache_fetch_historical_dataframe
 
 
 def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
@@ -76,9 +76,22 @@ def compute_ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 
-def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
+def fetch_historical_dataframe(
+    timeframe_minutes: int,
+    lookback_days: int,
+    *,
+    symbol: str,
+    exchange: str,
+    currency: str,
+) -> pd.DataFrame:
     """Fetch historical bars from cache (hourly base) and resample as needed."""
-    return get_resampled_bars(timeframe_minutes, lookback_days)
+    return cache_fetch_historical_dataframe(
+        timeframe_minutes,
+        lookback_days,
+        symbol=symbol,
+        exchange=exchange,
+        currency=currency,
+    )
 
 
 def ib_bar_size_setting(timeframe_minutes: int) -> str:
@@ -163,7 +176,9 @@ def _open_position(state: StrategyState, price: float, side: int, config: Strate
     state.be_triggered = False
 
 
-def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, float]:
+def backtest_strategy(
+    df: pd.DataFrame, params: StrategyConfig, return_equity: bool = False
+) -> Dict[str, object]:
     """Simulate strategy over historical bars using TradingView-like semantics."""
     if df is None or df.empty:
         return {"net_pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "trades": 0}
@@ -177,6 +192,7 @@ def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, flo
 
     state = StrategyState(cash=params.initial_capital)
     equity_curve = []
+    timestamps = []
 
     for _, row in df.iterrows():
         price = float(row.close)
@@ -210,6 +226,7 @@ def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, flo
                 _open_position(state, price, -1, params, equity)
 
         equity_curve.append(state.cash + state.position_qty * price)
+        timestamps.append(row.time if "time" in row else None)
 
     if state.position_side != 0 and not df.empty:
         last_price = float(df.iloc[-1].close)
@@ -225,18 +242,30 @@ def backtest_strategy(df: pd.DataFrame, params: StrategyConfig) -> Dict[str, flo
     drawdown = (equity_series - peak).min()
     returns = equity_series.pct_change().fillna(0)
     sharpe = returns.mean() / returns.std() * math.sqrt(252) if returns.std() > 0 else 0.0
-    return {
+    result: Dict[str, float] = {
         "net_pnl": float(net_pnl),
         "max_drawdown": float(drawdown),
         "sharpe": float(sharpe),
         "trades": state.trades,
     }
 
+    if return_equity:
+        result["equity_curve"] = equity_series.tolist()
+        result["timestamps"] = list(df["time"]) if "time" in df else timestamps
+
+    return result
+
 
 def run_basic_test() -> None:
     """Simple test entry point to compare against TradingView defaults."""
     cfg = StrategyConfig()
-    df = fetch_historical_dataframe(cfg.timeframe_minutes, cfg.lookback_days)
+    df = fetch_historical_dataframe(
+        cfg.timeframe_minutes,
+        cfg.lookback_days,
+        symbol=cfg.symbol,
+        exchange=EXCHANGE,
+        currency=CURRENCY,
+    )
     metrics = backtest_strategy(df, cfg)
     start_date = df["time"].iloc[0] if not df.empty else None
     end_date = df["time"].iloc[-1] if not df.empty else None

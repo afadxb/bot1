@@ -2,17 +2,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from ib_insync import Contract, IB, Stock
 
 from config import CLIENT_ID, CURRENCY, EXCHANGE, HOST, PORT, SYMBOL
 
 CACHE_TTL = dt.timedelta(hours=1)
 DB_PATH = Path("data_cache.sqlite")
+logger = logging.getLogger(__name__)
 
 def _to_naive_utc(ts: dt.datetime) -> dt.datetime:
     """Normalize timestamps to naive UTC for consistent storage/processing."""
@@ -53,8 +54,8 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def _cache_key(timeframe_minutes: int) -> tuple[str, str, str, int]:
-    return (SYMBOL, EXCHANGE, CURRENCY, timeframe_minutes)
+def _cache_key(timeframe_minutes: int, symbol: str, exchange: str, currency: str) -> tuple[str, str, str, int]:
+    return (symbol, exchange, currency, timeframe_minutes)
 
 
 def _is_fresh(fetched_at: str) -> bool:
@@ -65,13 +66,13 @@ def _is_fresh(fetched_at: str) -> bool:
     return dt.datetime.utcnow() - fetched_time <= CACHE_TTL
 
 
-def _read_cached_bars(timeframe_minutes: int) -> Optional[pd.DataFrame]:
+def _read_cached_bars(timeframe_minutes: int, symbol: str, exchange: str, currency: str) -> Optional[pd.DataFrame]:
     if not DB_PATH.exists():
         return None
 
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_tables(conn)
-        key = _cache_key(timeframe_minutes)
+        key = _cache_key(timeframe_minutes, symbol, exchange, currency)
         row = conn.execute(
             "SELECT fetched_at FROM cache_state WHERE symbol=? AND exchange=? AND currency=? AND timeframe=?",
             key,
@@ -94,16 +95,16 @@ def _read_cached_bars(timeframe_minutes: int) -> Optional[pd.DataFrame]:
         return df
 
 
-def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame) -> None:
+def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, exchange: str, currency: str) -> None:
     if df.empty:
         return
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     records = [
         (
-            SYMBOL,
-            EXCHANGE,
-            CURRENCY,
+            symbol,
+            exchange,
+            currency,
             timeframe_minutes,
             row.time.isoformat(),
             float(row.open),
@@ -119,7 +120,7 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame) -> None:
         with conn:
             conn.execute(
                 "DELETE FROM bars WHERE symbol=? AND exchange=? AND currency=? AND timeframe=?",
-                _cache_key(timeframe_minutes),
+                _cache_key(timeframe_minutes, symbol, exchange, currency),
             )
             conn.executemany(
                 """
@@ -134,15 +135,21 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame) -> None:
                 INSERT OR REPLACE INTO cache_state (symbol, exchange, currency, timeframe, fetched_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (*_cache_key(timeframe_minutes), dt.datetime.utcnow().isoformat()),
+                (*_cache_key(timeframe_minutes, symbol, exchange, currency), dt.datetime.utcnow().isoformat()),
             )
 
 
-def _fetch_hourly_from_ib(lookback_days: int) -> pd.DataFrame:
+def _fetch_hourly_from_ib(lookback_days: int, symbol: str, exchange: str, currency: str) -> pd.DataFrame:
+    """Lazy-import ib_insync to avoid event loop creation when unused."""
+    try:
+        from ib_insync import Contract, IB, Stock
+    except Exception as exc:  # pragma: no cover - defensive import path
+        raise RuntimeError("ib_insync is required for IBKR data fetching") from exc
+
     ib = IB()
     try:
         ib.connect(HOST, PORT, clientId=CLIENT_ID + 200, timeout=5)
-        contract: Contract = Stock(SYMBOL, EXCHANGE, CURRENCY)
+        contract: Contract = Stock(symbol, exchange, currency)
         ib.qualifyContracts(contract)
         bars = ib.reqHistoricalData(
             contract,
@@ -172,12 +179,41 @@ def _fetch_hourly_from_ib(lookback_days: int) -> pd.DataFrame:
         ib.disconnect()
 
 
-def _hourly_dataframe(lookback_days: int) -> pd.DataFrame:
-    base_df = _read_cached_bars(60)
+def _fetch_hourly_from_yfinance(lookback_days: int, symbol: str) -> pd.DataFrame:
+    """Fallback hourly fetch using yfinance when IBKR is unavailable."""
+    try:
+        import yfinance as yf
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logger.warning("yfinance not available for fallback data: %s", exc)
+        return pd.DataFrame()
+
+    period_days = min(lookback_days, 730)  # yfinance caps at ~730 days for 60m interval
+    try:
+        raw = yf.download(symbol, period=f"{period_days}d", interval="60m", progress=False)
+    except Exception as exc:  # pragma: no cover - network errors
+        logger.warning("yfinance download failed: %s", exc)
+        return pd.DataFrame()
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    raw = raw.reset_index().rename(
+        columns={"Datetime": "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+    )
+    raw["time"] = pd.to_datetime(raw["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
+    return raw[["time", "open", "high", "low", "close", "volume"]]
+
+
+def _hourly_dataframe(lookback_days: int, symbol: str, exchange: str, currency: str) -> pd.DataFrame:
+    base_df = _read_cached_bars(60, symbol, exchange, currency)
     if base_df is None:
-        base_df = _fetch_hourly_from_ib(lookback_days)
+        try:
+            base_df = _fetch_hourly_from_ib(lookback_days, symbol, exchange, currency)
+        except RuntimeError as exc:
+            logger.warning("Unable to fetch hourly data from IBKR: %s", exc)
+            base_df = _fetch_hourly_from_yfinance(lookback_days, symbol)
         if not base_df.empty:
-            _write_cached_bars(60, base_df)
+            _write_cached_bars(60, base_df, symbol, exchange, currency)
 
     if base_df is None:
         return pd.DataFrame()
@@ -202,9 +238,27 @@ def _resample_dataframe(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFram
     return agg
 
 
-def get_resampled_bars(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
+def get_resampled_bars(
+    timeframe_minutes: int,
+    lookback_days: int,
+    symbol: str = SYMBOL,
+    exchange: str = EXCHANGE,
+    currency: str = CURRENCY,
+) -> pd.DataFrame:
     """Return cached/resampled bars for the requested timeframe."""
-    hourly_df = _hourly_dataframe(lookback_days)
+    hourly_df = _hourly_dataframe(lookback_days, symbol, exchange, currency)
     if timeframe_minutes == 60:
         return hourly_df
     return _resample_dataframe(hourly_df, timeframe_minutes)
+
+
+def fetch_historical_dataframe(
+    timeframe_minutes: int,
+    lookback_days: int,
+    *,
+    symbol: str = SYMBOL,
+    exchange: str = EXCHANGE,
+    currency: str = CURRENCY,
+) -> pd.DataFrame:
+    """Public helper to fetch/resample bars for consumers like backtests and dashboards."""
+    return get_resampled_bars(timeframe_minutes, lookback_days, symbol=symbol, exchange=exchange, currency=currency)
