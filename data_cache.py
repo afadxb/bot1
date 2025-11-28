@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from ib_insync import Contract, IB, Stock
 
 from config import CLIENT_ID, CURRENCY, EXCHANGE, HOST, PORT, SYMBOL
 
@@ -139,6 +138,12 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame) -> None:
 
 
 def _fetch_hourly_from_ib(lookback_days: int) -> pd.DataFrame:
+    """Lazy-import ib_insync to avoid event loop creation when unused."""
+    try:
+        from ib_insync import Contract, IB, Stock
+    except Exception as exc:  # pragma: no cover - defensive import path
+        raise RuntimeError("ib_insync is required for IBKR data fetching") from exc
+
     ib = IB()
     try:
         ib.connect(HOST, PORT, clientId=CLIENT_ID + 200, timeout=5)
