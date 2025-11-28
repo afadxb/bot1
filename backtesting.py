@@ -8,7 +8,7 @@ from typing import Dict, Optional
 import pandas as pd
 
 from config import StrategyConfig
-from data_cache import get_resampled_bars
+from data_cache import fetch_historical_dataframe as cache_fetch_historical_dataframe
 
 
 def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
@@ -78,7 +78,7 @@ def compute_ema(series: pd.Series, length: int) -> pd.Series:
 
 def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
     """Fetch historical bars from cache (hourly base) and resample as needed."""
-    return get_resampled_bars(timeframe_minutes, lookback_days)
+    return cache_fetch_historical_dataframe(timeframe_minutes, lookback_days)
 
 
 def ib_bar_size_setting(timeframe_minutes: int) -> str:

@@ -208,3 +208,8 @@ def get_resampled_bars(timeframe_minutes: int, lookback_days: int) -> pd.DataFra
     if timeframe_minutes == 60:
         return hourly_df
     return _resample_dataframe(hourly_df, timeframe_minutes)
+
+
+def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
+    """Public helper to fetch/resample bars for consumers like backtests and dashboards."""
+    return get_resampled_bars(timeframe_minutes, lookback_days)
