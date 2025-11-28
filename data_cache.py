@@ -99,6 +99,12 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, ex
     if df.empty:
         return
 
+    normalized = df.copy()
+    if "time" not in normalized.columns:
+        normalized = normalized.reset_index()
+        if "time" not in normalized.columns and "index" in normalized.columns:
+            normalized = normalized.rename(columns={"index": "time"})
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     records = [
         (
@@ -106,14 +112,15 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, ex
             exchange,
             currency,
             timeframe_minutes,
-            row.time.isoformat(),
+            pd.to_datetime(row.time, utc=True, errors="coerce").tz_convert("UTC").tz_localize(None).isoformat(),
             float(row.open),
             float(row.high),
             float(row.low),
             float(row.close),
             float(row.volume),
         )
-        for row in df.itertuples()
+        for row in normalized.itertuples()
+        if getattr(row, "time", None) is not None
     ]
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_tables(conn)
