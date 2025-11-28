@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict
 
 HOST = "127.0.0.1"
-PORT = 4002  # 7497 for paper, 7496 for live
+PORT = 7497  # 7497 for paper, 7496 for live
 CLIENT_ID = 102
 
 SYMBOL = "TSLA"
@@ -17,7 +17,7 @@ CURRENCY = "USD"
 DEFAULT_TIMEFRAME_MINUTES = 180  # 3-hour default for live trading
 MIN_HISTORY_BARS = 100  # to warm up indicators
 
-LIVE_TRADING = False  # Set to True to actually transmit orders
+LIVE_TRADING = True  # Set to True to actually transmit orders
 ENABLE_WEEKLY_OPTIMIZATION = True
 WEEKLY_OPTIMIZATION_DAY = 6  # Sunday (0=Monday ... 6=Sunday)
 WEEKLY_OPTIMIZATION_HOUR = 20  # 8pm UTC by default
@@ -47,16 +47,6 @@ class StrategyConfig:
     use_be: bool = True
     be_trigger_percent: float = 0.01
     position_size_pct: float = 10
-    # ATR-based risk (optional; disabled by default)
-    use_atr_risk: bool = False
-    atr_length: int = 14
-    atr_sl_mult: float = 1.5
-    atr_trail_mult: float = 1.5
-    atr_be_mult: float = 0.75
-    # Execution tweaks
-    use_marketable_limits: bool = True
-    entry_limit_offset: float = 0.05
-    exit_limit_offset: float = 0.05
     risk_params: Dict[str, float] = field(default_factory=dict)
 
 

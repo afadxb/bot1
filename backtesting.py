@@ -8,8 +8,6 @@ import pandas as pd
 
 from data_cache import get_resampled_bars
 
-_ADX_CACHE: Dict[tuple, pd.Series] = {}
-
 
 def rank_better(metrics: Dict[str, float], incumbent: Dict[str, float]) -> bool:
     """Return True if metrics outrank incumbent based on PnL, drawdown, Sharpe."""
@@ -33,22 +31,7 @@ def ib_bar_size_setting(timeframe_minutes: int) -> str:
     return f"{timeframe_minutes} mins"
 
 
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    highs = df["high"]
-    lows = df["low"]
-    closes = df["close"]
-    return pd.concat([
-        highs - lows,
-        (highs - closes.shift()).abs(),
-        (lows - closes.shift()).abs(),
-    ], axis=1).max(axis=1)
-
-
 def _compute_adx_series(df: pd.DataFrame, length: int) -> pd.Series:
-    key = (id(df), length, len(df))
-    if key in _ADX_CACHE:
-        return _ADX_CACHE[key]
-
     highs = df["high"]
     lows = df["low"]
     closes = df["close"]
@@ -56,23 +39,17 @@ def _compute_adx_series(df: pd.DataFrame, length: int) -> pd.Series:
     down_move = lows.shift(1) - lows
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-    tr = _true_range(df)
+    tr = pd.concat([
+        highs - lows,
+        (highs - closes.shift()).abs(),
+        (lows - closes.shift()).abs(),
+    ], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / length, adjust=False).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr)
     minus_di = 100 * (minus_dm.ewm(alpha=1 / length, adjust=False).mean() / atr)
     dx = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di).abs()) * 100
-    adx = dx.ewm(alpha=1 / length, adjust=False).mean().fillna(0)
-    _ADX_CACHE[key] = adx
-    return adx
-
-
-def _compute_atr(df: pd.DataFrame, length: int) -> pd.Series:
-    """
-    Compute ATR series of given length using the same TR logic as ADX.
-    """
-    tr = _true_range(df)
-    atr = tr.ewm(alpha=1 / length, adjust=False).mean()
-    return atr.ffill().fillna(0)
+    adx = dx.ewm(alpha=1 / length, adjust=False).mean()
+    return adx.fillna(0)
 
 
 def backtest_strategy(df: pd.DataFrame, params) -> Dict[str, float]:
@@ -80,17 +57,12 @@ def backtest_strategy(df: pd.DataFrame, params) -> Dict[str, float]:
     if df.empty:
         return {"net_pnl": 0.0, "max_drawdown": 0.0, "sharpe": 0.0, "trades": 0}
 
-    adx_series = _compute_adx_series(df, params.adx_length)
-    atr_series = _compute_atr(df, params.atr_length) if getattr(params, "use_atr_risk", False) else None
-
     df = df.copy()
     df["fast"] = df["close"].ewm(span=params.fast_ema, adjust=False).mean()
     df["slow"] = df["close"].ewm(span=params.slow_ema, adjust=False).mean()
     df["fast_prev"] = df["fast"].shift(1)
     df["slow_prev"] = df["slow"].shift(1)
-    df["adx"] = adx_series.reindex(df.index).fillna(0)
-    if atr_series is not None:
-        df["atr"] = atr_series.reindex(df.index).fillna(0)
+    df["adx"] = _compute_adx_series(df, params.adx_length)
 
     position = 0  # +1 long, -1 short
     entry_price = 0.0
@@ -111,12 +83,6 @@ def backtest_strategy(df: pd.DataFrame, params) -> Dict[str, float]:
         price = row.close
         high = row.high
         low = row.low
-        atr_val = getattr(row, "atr", None) if getattr(params, "use_atr_risk", False) else None
-        atr_ready = (
-            atr_val is not None
-            and not math.isnan(atr_val)
-            and atr_val > 0
-        )
 
         ema_crossover = prev_fast <= prev_slow and fast > slow
         ema_crossunder = prev_fast >= prev_slow and fast < slow
@@ -126,24 +92,14 @@ def backtest_strategy(df: pd.DataFrame, params) -> Dict[str, float]:
         if position != 0:
             if position > 0:
                 high_since_entry = max(high_since_entry or price, high)
-                if params.use_atr_risk and atr_ready:
-                    base_stop = entry_price - params.atr_sl_mult * atr_val if params.use_sl else None
-                    if params.use_be and high_since_entry > entry_price + params.atr_be_mult * atr_val:
-                        be_triggered = True
-                    if be_triggered:
-                        base_stop = max(base_stop or 0, entry_price)
-                    trail_candidate = None
-                    if params.use_trail and price > entry_price:
-                        trail_candidate = price - params.atr_trail_mult * atr_val
-                else:
-                    if params.use_be and high_since_entry > entry_price * (1 + params.be_trigger_percent):
-                        be_triggered = True
-                    base_stop = entry_price * (1 - params.sl_percent) if params.use_sl else None
-                    if be_triggered:
-                        base_stop = max(base_stop or 0, entry_price)
-                    trail_candidate = None
-                    if params.use_trail and price > entry_price * (1 + params.trail_offset):
-                        trail_candidate = price - entry_price * params.trail_percent
+                if params.use_be and high_since_entry > entry_price * (1 + params.be_trigger_percent):
+                    be_triggered = True
+                base_stop = entry_price * (1 - params.sl_percent) if params.use_sl else None
+                if be_triggered:
+                    base_stop = max(base_stop or 0, entry_price)
+                trail_candidate = None
+                if params.use_trail and price > entry_price * (1 + params.trail_offset):
+                    trail_candidate = price - entry_price * params.trail_percent
                 stop_price = max(v for v in [base_stop, trail_candidate] if v is not None) if any(
                     v is not None for v in [base_stop, trail_candidate]
                 ) else stop_price
@@ -154,24 +110,14 @@ def backtest_strategy(df: pd.DataFrame, params) -> Dict[str, float]:
                     stop_price = None
             else:  # short
                 low_since_entry = min(low_since_entry or price, low)
-                if params.use_atr_risk and atr_ready:
-                    base_stop = entry_price + params.atr_sl_mult * atr_val if params.use_sl else None
-                    if params.use_be and low_since_entry < entry_price - params.atr_be_mult * atr_val:
-                        be_triggered = True
-                    if be_triggered:
-                        base_stop = min(base_stop or float("inf"), entry_price)
-                    trail_candidate = None
-                    if params.use_trail and price < entry_price:
-                        trail_candidate = price + params.atr_trail_mult * atr_val
-                else:
-                    if params.use_be and low_since_entry < entry_price * (1 - params.be_trigger_percent):
-                        be_triggered = True
-                    base_stop = entry_price * (1 + params.sl_percent) if params.use_sl else None
-                    if be_triggered:
-                        base_stop = min(base_stop or float("inf"), entry_price)
-                    trail_candidate = None
-                    if params.use_trail and price < entry_price * (1 - params.trail_offset):
-                        trail_candidate = price + entry_price * params.trail_percent
+                if params.use_be and low_since_entry < entry_price * (1 - params.be_trigger_percent):
+                    be_triggered = True
+                base_stop = entry_price * (1 + params.sl_percent) if params.use_sl else None
+                if be_triggered:
+                    base_stop = min(base_stop or float("inf"), entry_price)
+                trail_candidate = None
+                if params.use_trail and price < entry_price * (1 - params.trail_offset):
+                    trail_candidate = price + entry_price * params.trail_percent
                 stop_price = min(v for v in [base_stop, trail_candidate] if v is not None) if any(
                     v is not None for v in [base_stop, trail_candidate]
                 ) else stop_price

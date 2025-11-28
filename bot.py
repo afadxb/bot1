@@ -168,6 +168,32 @@ class EmaAdxBot:
             return True
         return (now - self._last_hourly_tick) >= dt.timedelta(hours=1) - dt.timedelta(seconds=5)
 
+    def _sync_open_stop(self) -> None:
+        """Populate self.stop_order from existing open stop/stop-limit orders to prevent duplicates."""
+        if self.position_side == "flat":
+            self.stop_order = None
+            return
+        try:
+            open_trades = self.ib.openTrades()
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning(f"Unable to fetch open orders to sync stops: {exc}")
+            return
+        for trade in open_trades:
+            contract = trade.contract
+            order = trade.order
+            if contract.conId != self.contract.conId and (
+                contract.symbol != self.contract.symbol or contract.exchange != self.contract.exchange
+            ):
+                continue
+            if "STP" in (order.orderType or ""):
+                if self.stop_order is None or getattr(order, "orderId", 0) > getattr(self.stop_order, "orderId", -1):
+                    self.stop_order = order
+        if self.stop_order:
+            self.logger.info(
+                f"Synced existing stop order (id={getattr(self.stop_order, 'orderId', '?')}) at "
+                f"{getattr(self.stop_order, 'auxPrice', 0):.2f}"
+            )
+
     @staticmethod
     def _rt_value(bar: RealTimeBar, field: str) -> float:
         """Access RT bar fields consistently across ib_insync versions."""
@@ -177,6 +203,13 @@ class EmaAdxBot:
         if val is None:
             raise AttributeError(f"RealTimeBar missing expected field '{field}'/'{field}_'")
         return val
+
+    @staticmethod
+    def _apply_min_tick(price: float, min_tick: float = 0.05) -> float:
+        """Round price to the nearest permissible increment."""
+        if min_tick <= 0:
+            return price
+        return round(price / min_tick) * min_tick
 
     def _load_initial_history(self) -> None:
         """Prefill bars using historical data to warm up indicators."""
@@ -298,27 +331,6 @@ class EmaAdxBot:
         adx = dx.ewm(alpha=1 / self.config.adx_length, adjust=False).mean()
         return float(adx.iloc[-1]) if not math.isnan(adx.iloc[-1]) else 0.0
 
-    def _compute_atr(self, length: int) -> Optional[float]:
-        """
-        Compute latest ATR over self.bars for the given length.
-        Return None if not enough data.
-        """
-        if len(self.bars) < length + 1:
-            return None
-        highs = pd.Series([b.high for b in self.bars])
-        lows = pd.Series([b.low for b in self.bars])
-        closes = pd.Series([b.close for b in self.bars])
-        tr = pd.concat([
-            highs - lows,
-            (highs - closes.shift()).abs(),
-            (lows - closes.shift()).abs(),
-        ], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1 / length, adjust=False).mean()
-        value = atr.iloc[-1]
-        if math.isnan(value):
-            return None
-        return float(value)
-
     # -------------------------
     # Strategy logic
     # -------------------------
@@ -374,12 +386,6 @@ class EmaAdxBot:
             return
         action = "BUY" if side == "long" else "SELL"
         limit_price = price
-        if self.config.use_marketable_limits:
-            if side == "long":
-                limit_price = price + self.config.entry_limit_offset
-            else:
-                limit_price = price - self.config.entry_limit_offset
-        limit_price = self._apply_min_tick(limit_price)
         self.logger.info(f"Placing {side} entry for {qty} shares with limit {limit_price:.2f}.")
         order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         trade = self.ib.placeOrder(self.contract, order)
@@ -399,21 +405,9 @@ class EmaAdxBot:
             return
         action = "SELL" if self.position_side == "long" else "BUY"
         qty = abs(self._current_position_size())
-        last_close = self.bars[-1].close
-        limit_price = last_close
-        if self.config.use_marketable_limits:
-            if action == "SELL":
-                limit_price = last_close - self.config.exit_limit_offset
-            else:
-                limit_price = last_close + self.config.exit_limit_offset
-        limit_price = self._apply_min_tick(limit_price)
-        if self.position_side == "long":
-            approx_pnl = (limit_price - self.entry_price) * qty
-        else:
-            approx_pnl = (self.entry_price - limit_price) * qty
+        limit_price = self.bars[-1].close
         self.logger.info(
-            f"Closing {self.position_side} position of {qty} shares at limit {limit_price:.2f} "
-            f"(entry {self.entry_price:.2f}), approx PnL={approx_pnl:.2f}"
+            f"Closing {self.position_side} position of {qty} shares with limit {limit_price:.2f}."
         )
         order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         self.ib.placeOrder(self.contract, order)
@@ -426,6 +420,7 @@ class EmaAdxBot:
     def manage_risk(self) -> None:
         if self.position_side == "flat":
             return
+        self._sync_open_stop()
         current_price = self.bars[-1].close
         current_high = self.bars[-1].high
         current_low = self.bars[-1].low
@@ -433,51 +428,31 @@ class EmaAdxBot:
         if position_qty == 0:
             return
         entry = self.entry_price or current_price
-        atr_value = self._compute_atr(self.config.atr_length) if self.config.use_atr_risk else None
-        atr_ready = atr_value is not None and not math.isnan(atr_value) and atr_value > 0
 
         stop_price = None
         trail_candidate = None
 
         if self.position_side == "long":
+            base_stop = entry * (1 - self.config.sl_percent) if self.config.use_sl else None
             self.high_since_entry = max(self.high_since_entry or entry, current_high)
-            if self.config.use_atr_risk and atr_ready:
-                base_stop = entry - self.config.atr_sl_mult * atr_value if self.config.use_sl else None
-                if self.config.use_be and self.high_since_entry > entry + self.config.atr_be_mult * atr_value:
-                    self.be_triggered = True
-                if self.be_triggered:
-                    base_stop = max(base_stop or 0, entry)
-                if self.config.use_trail and current_price > entry:
-                    trail_candidate = current_price - self.config.atr_trail_mult * atr_value
-            else:
-                base_stop = entry * (1 - self.config.sl_percent) if self.config.use_sl else None
-                if self.config.use_be and self.high_since_entry > entry * (1 + self.config.be_trigger_percent):
-                    self.be_triggered = True
-                if self.be_triggered:
-                    base_stop = max(base_stop or 0, entry)
-                if self.config.use_trail and current_price > entry * (1 + self.config.trail_offset):
-                    trail_candidate = current_price - entry * self.config.trail_percent
+            if self.config.use_be and self.high_since_entry > entry * (1 + self.config.be_trigger_percent):
+                self.be_triggered = True
+            if self.be_triggered:
+                base_stop = max(base_stop or 0, entry)
+            if self.config.use_trail and current_price > entry * (1 + self.config.trail_offset):
+                trail_candidate = current_price - entry * self.config.trail_percent
             stop_price = max(v for v in [base_stop, trail_candidate] if v is not None) if any(
                 v is not None for v in [base_stop, trail_candidate]
             ) else None
         elif self.position_side == "short":
+            base_stop = entry * (1 + self.config.sl_percent) if self.config.use_sl else None
             self.low_since_entry = min(self.low_since_entry or entry, current_low)
-            if self.config.use_atr_risk and atr_ready:
-                base_stop = entry + self.config.atr_sl_mult * atr_value if self.config.use_sl else None
-                if self.config.use_be and self.low_since_entry < entry - self.config.atr_be_mult * atr_value:
-                    self.be_triggered = True
-                if self.be_triggered:
-                    base_stop = min(base_stop or float("inf"), entry)
-                if self.config.use_trail and current_price < entry:
-                    trail_candidate = current_price + self.config.atr_trail_mult * atr_value
-            else:
-                base_stop = entry * (1 + self.config.sl_percent) if self.config.use_sl else None
-                if self.config.use_be and self.low_since_entry < entry * (1 - self.config.be_trigger_percent):
-                    self.be_triggered = True
-                if self.be_triggered:
-                    base_stop = min(base_stop or float("inf"), entry)
-                if self.config.use_trail and current_price < entry * (1 - self.config.trail_offset):
-                    trail_candidate = current_price + entry * self.config.trail_percent
+            if self.config.use_be and self.low_since_entry < entry * (1 - self.config.be_trigger_percent):
+                self.be_triggered = True
+            if self.be_triggered:
+                base_stop = min(base_stop or float("inf"), entry)
+            if self.config.use_trail and current_price < entry * (1 - self.config.trail_offset):
+                trail_candidate = current_price + entry * self.config.trail_percent
             stop_price = min(v for v in [base_stop, trail_candidate] if v is not None) if any(
                 v is not None for v in [base_stop, trail_candidate]
             ) else None
@@ -552,16 +527,6 @@ class EmaAdxBot:
     # -------------------------
     # Utilities
     # -------------------------
-    def _apply_min_tick(self, price: float) -> float:
-        try:
-            details = self.ib.reqContractDetails(self.contract)
-            min_tick = details[0].minTick if details and details[0].minTick else 0.01
-        except Exception:
-            min_tick = 0.01
-        if min_tick <= 0:
-            min_tick = 0.01
-        return round(price / min_tick) * min_tick
-
     def _compute_position_size(self, price: float) -> int:
         account = self.ib.accountSummary()
         net_liq = 0.0
@@ -591,8 +556,10 @@ class EmaAdxBot:
                 self.entry_price = pos.avgCost
                 self.high_since_entry = self.entry_price
                 self.low_since_entry = self.entry_price
+                self._sync_open_stop()
                 return
         self.position_side = "flat"
+        self.stop_order = None
 
     def _current_position_size(self) -> float:
         positions = self.ib.positions()
