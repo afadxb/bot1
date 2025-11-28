@@ -8,7 +8,6 @@ all parameters before enabling LIVE_TRADING.
 from __future__ import annotations
 
 import datetime as dt
-import math
 import logging
 import threading
 import time
@@ -21,6 +20,15 @@ import pandas as pd
 from ib_insync import (BarDataList, Contract, IB, LimitOrder, Order,
                        RealTimeBar, Stock)
 
+from backtesting import (
+    StrategyState,
+    compute_dmi_adx,
+    compute_ema,
+    ema_cross_signals,
+    _close_position as sim_close_position,
+    _open_position as sim_open_position,
+    update_stop_price,
+)
 from data_cache import get_resampled_bars
 from config import (CLIENT_ID, CONFIG_PATH, CURRENCY, ENABLE_MARKET_HOURLY_LOOP,
                     ENABLE_WEEKLY_OPTIMIZATION, EXCHANGE, HOST, LIVE_TRADING,
@@ -68,6 +76,7 @@ class EmaAdxBot:
         self.high_since_entry: Optional[float] = None
         self.low_since_entry: Optional[float] = None
         self.config = config
+        self.state = StrategyState(cash=config.initial_capital)
         self._maintenance_thread: Optional[threading.Thread] = None
         self._last_optimization_date: Optional[dt.date] = None
         self._last_hourly_tick: Optional[dt.datetime] = None
@@ -213,7 +222,7 @@ class EmaAdxBot:
 
     def _load_initial_history(self) -> None:
         """Prefill bars using historical data to warm up indicators."""
-        hist_df = get_resampled_bars(self.config.timeframe_minutes, lookback_days=30)
+        hist_df = get_resampled_bars(self.config.timeframe_minutes, lookback_days=self.config.lookback_days)
         if hist_df.empty:
             self.logger.warning("No historical data available from cache/IB.")
             return
@@ -290,46 +299,22 @@ class EmaAdxBot:
     # Indicator calculations
     # -------------------------
     def update_indicators(self) -> None:
-        closes = [b.close for b in self.bars]
-        if len(closes) < max(self.config.fast_ema, self.config.slow_ema, self.config.adx_length + 1):
+        if len(self.bars) < max(self.config.ema_fast, self.config.ema_slow, self.config.adx_length + 1):
             return
-        series = pd.Series(closes)
-        fast_ema = series.ewm(span=self.config.fast_ema, adjust=False).mean()
-        slow_ema = series.ewm(span=self.config.slow_ema, adjust=False).mean()
+        df = pd.DataFrame([b.__dict__ for b in self.bars])
+        df["fast"] = compute_ema(df["close"], self.config.ema_fast)
+        df["slow"] = compute_ema(df["close"], self.config.ema_slow)
+        df["fast_prev"] = df["fast"].shift(1)
+        df["slow_prev"] = df["slow"].shift(1)
+        df["adx"] = compute_dmi_adx(df, self.config.adx_length)
 
-        prev_fast = self.indicators.fast_ema
-        prev_slow = self.indicators.slow_ema
-        self.indicators.prev_fast_ema = prev_fast
-        self.indicators.prev_slow_ema = prev_slow
-        self.indicators.fast_ema = float(fast_ema.iloc[-1])
-        self.indicators.slow_ema = float(slow_ema.iloc[-1])
-        self.indicators.adx = self._compute_adx()
-
-    def _compute_adx(self) -> float:
-        if len(self.bars) < self.config.adx_length + 1:
-            return 0.0
-        highs = pd.Series([b.high for b in self.bars])
-        lows = pd.Series([b.low for b in self.bars])
-        closes = pd.Series([b.close for b in self.bars])
-
-        up_move = highs.diff()
-        down_move = lows.shift(1) - lows
-
-        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-        tr = pd.concat([
-            highs - lows,
-            (highs - closes.shift()).abs(),
-            (lows - closes.shift()).abs(),
-        ], axis=1).max(axis=1)
-
-        atr = tr.ewm(alpha=1 / self.config.adx_length, adjust=False).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1 / self.config.adx_length, adjust=False).mean() / atr)
-        minus_di = 100 * (minus_dm.ewm(alpha=1 / self.config.adx_length, adjust=False).mean() / atr)
-        dx = (plus_di.subtract(minus_di).abs() / (plus_di + minus_di).abs()) * 100
-        adx = dx.ewm(alpha=1 / self.config.adx_length, adjust=False).mean()
-        return float(adx.iloc[-1]) if not math.isnan(adx.iloc[-1]) else 0.0
+        if len(df) < 2:
+            return
+        self.indicators.prev_fast_ema = float(df.iloc[-2].fast)
+        self.indicators.prev_slow_ema = float(df.iloc[-2].slow)
+        self.indicators.fast_ema = float(df.iloc[-1].fast)
+        self.indicators.slow_ema = float(df.iloc[-1].slow)
+        self.indicators.adx = float(df.iloc[-1].adx)
 
     # -------------------------
     # Strategy logic
@@ -349,34 +334,43 @@ class EmaAdxBot:
             f"Bar closed. Fast EMA={fast:.2f}, Slow EMA={slow:.2f}, PrevFast={prev_fast:.2f}, PrevSlow={prev_slow:.2f}, ADX={adx_val:.2f}"
         )
 
-        ema_crossover = prev_fast <= prev_slow and fast > slow
-        ema_crossunder = prev_fast >= prev_slow and fast < slow
+        signals = ema_cross_signals(fast, slow, prev_fast, prev_slow)
         adx_condition = (adx_val > self.config.adx_threshold) if self.config.use_adx else True
 
         self._refresh_position_state()
 
-        # Reverse exits
-        if self.position_side == "long" and ema_crossunder:
+        # Stop logic
+        if self.state.position_side != 0:
+            bar_row = pd.Series({"close": self.bars[-1].close, "high": self.bars[-1].high, "low": self.bars[-1].low})
+            stop_price = update_stop_price(self.state, bar_row, self.config)
+            if stop_price is not None:
+                if (self.state.position_side > 0 and self.bars[-1].low <= stop_price) or (
+                    self.state.position_side < 0 and self.bars[-1].high >= stop_price
+                ):
+                    self.logger.info(f"Stop hit at {stop_price:.2f}; closing position.")
+                    self.close_position(exit_price=stop_price)
+
+        ema_crossover = signals["cross_up"]
+        ema_crossunder = signals["cross_down"]
+
+        if self.state.position_side > 0 and ema_crossunder:
             self.logger.info("EMA reverse exit triggered for long.")
             self.close_position()
-        elif self.position_side == "short" and ema_crossover:
+            if self.config.trade_direction in ("Short", "Both") and adx_condition:
+                self.enter_position("short")
+        elif self.state.position_side < 0 and ema_crossover:
             self.logger.info("EMA reverse exit triggered for short.")
             self.close_position()
-
-        # Entries
-        if (self.config.trade_direction in ("Long", "Both")) and ema_crossover and adx_condition:
-            if self.position_side != "long":
-                if self.position_side == "short":
-                    self.close_position()
+            if self.config.trade_direction in ("Long", "Both") and adx_condition:
                 self.enter_position("long")
-        if (self.config.trade_direction in ("Short", "Both")) and ema_crossunder and adx_condition:
-            if self.position_side != "short":
-                if self.position_side == "long":
-                    self.close_position()
+        elif self.state.position_side == 0:
+            if (self.config.trade_direction in ("Long", "Both")) and ema_crossover and adx_condition:
+                self.enter_position("long")
+            elif (self.config.trade_direction in ("Short", "Both")) and ema_crossunder and adx_condition:
                 self.enter_position("short")
 
-        # Risk management adjustments
-        self.manage_risk()
+        if self.state.stop_price is not None:
+            self._place_or_update_stop(self.state.stop_price)
 
     def enter_position(self, side: str) -> None:
         price = self.bars[-1].close
@@ -388,89 +382,53 @@ class EmaAdxBot:
         limit_price = price
         self.logger.info(f"Placing {side} entry for {qty} shares with limit {limit_price:.2f}.")
         order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
-        trade = self.ib.placeOrder(self.contract, order)
-        self.ib.sleep(1)
-        if trade.orderStatus.status in {"Filled", "Submitted"}:
-            self.position_side = side
-            self.entry_price = price
-            self.be_triggered = False
-            self.stop_order = None
-            self.high_since_entry = price
-            self.low_since_entry = price
-            self.logger.info(f"Entered {side} at ~{price:.2f}. Live={LIVE_TRADING}")
+        self.ib.placeOrder(self.contract, order)
+        sim_open_position(self.state, price, 1 if side == "long" else -1, self.config, self._current_equity(price))
+        self.position_side = side
+        self.entry_price = price
+        self.be_triggered = False
+        self.stop_order = None
+        self.high_since_entry = price
+        self.low_since_entry = price
+        self.logger.info(f"Entered {side} at ~{price:.2f}. Live={LIVE_TRADING}")
 
-    def close_position(self) -> None:
+    def close_position(self, exit_price: Optional[float] = None) -> None:
         self._refresh_position_state()
         if self.position_side == "flat":
             return
         action = "SELL" if self.position_side == "long" else "BUY"
         qty = abs(self._current_position_size())
-        limit_price = self.bars[-1].close
+        limit_price = exit_price or self.bars[-1].close
         self.logger.info(
             f"Closing {self.position_side} position of {qty} shares with limit {limit_price:.2f}."
         )
         order = LimitOrder(action, qty, limit_price, transmit=LIVE_TRADING)
         self.ib.placeOrder(self.contract, order)
+        sim_close_position(self.state, limit_price)
         self.stop_order = None
         self.be_triggered = False
         self.position_side = "flat"
+        self.state.position_qty = 0
+        self.state.position_side = 0
         self.high_since_entry = None
         self.low_since_entry = None
 
     def manage_risk(self) -> None:
-        if self.position_side == "flat":
+        return  # risk handled in on_bar_close
+
+    def _place_or_update_stop(self, stop_price: float) -> None:
+        if self.state.position_side == 0:
             return
-        self._sync_open_stop()
-        current_price = self.bars[-1].close
-        current_high = self.bars[-1].high
-        current_low = self.bars[-1].low
-        position_qty = abs(self._current_position_size())
+        stop_price = self._apply_min_tick(stop_price)
+        position_qty = abs(self.state.position_qty)
         if position_qty == 0:
             return
-        entry = self.entry_price or current_price
-
-        stop_price = None
-        trail_candidate = None
-
-        if self.position_side == "long":
-            base_stop = entry * (1 - self.config.sl_percent) if self.config.use_sl else None
-            self.high_since_entry = max(self.high_since_entry or entry, current_high)
-            if self.config.use_be and self.high_since_entry > entry * (1 + self.config.be_trigger_percent):
-                self.be_triggered = True
-            if self.be_triggered:
-                base_stop = max(base_stop or 0, entry)
-            if self.config.use_trail and current_price > entry * (1 + self.config.trail_offset):
-                trail_candidate = current_price - entry * self.config.trail_percent
-            stop_price = max(v for v in [base_stop, trail_candidate] if v is not None) if any(
-                v is not None for v in [base_stop, trail_candidate]
-            ) else None
-        elif self.position_side == "short":
-            base_stop = entry * (1 + self.config.sl_percent) if self.config.use_sl else None
-            self.low_since_entry = min(self.low_since_entry or entry, current_low)
-            if self.config.use_be and self.low_since_entry < entry * (1 - self.config.be_trigger_percent):
-                self.be_triggered = True
-            if self.be_triggered:
-                base_stop = min(base_stop or float("inf"), entry)
-            if self.config.use_trail and current_price < entry * (1 - self.config.trail_offset):
-                trail_candidate = current_price + entry * self.config.trail_percent
-            stop_price = min(v for v in [base_stop, trail_candidate] if v is not None) if any(
-                v is not None for v in [base_stop, trail_candidate]
-            ) else None
-
-        if stop_price is None:
-            return
-
-        stop_price = self._apply_min_tick(stop_price)
-
         if self.stop_order and abs(self.stop_order.auxPrice - stop_price) / stop_price < 0.001:
-            return  # no meaningful change
-
-        # Cancel previous stop if exists
+            return
         if self.stop_order:
             self.logger.info("Modifying existing stop order.")
             self.ib.cancelOrder(self.stop_order)
-
-        stop_action = "SELL" if self.position_side == "long" else "BUY"
+        stop_action = "SELL" if self.state.position_side > 0 else "BUY"
         stop_order = Order(
             action=stop_action,
             orderType="STP LMT",
@@ -481,7 +439,9 @@ class EmaAdxBot:
         )
         self.stop_order = stop_order
         self.ib.placeOrder(self.contract, stop_order)
-        self.logger.info(f"Placed/updated stop at {stop_price:.2f} for {self.position_side} position. Live={LIVE_TRADING}")
+        self.logger.info(
+            f"Placed/updated stop at {stop_price:.2f} for {self.position_side or 'flat'} position. Live={LIVE_TRADING}"
+        )
 
     # -------------------------
     # Optimization & backtesting
@@ -508,8 +468,8 @@ class EmaAdxBot:
         """Reload bars and indicators using the optimized configuration."""
         self.config = config
         self.logger.info(
-            f"Switching to timeframe {config.timeframe_minutes}m, Fast EMA {config.fast_ema}, "
-            f"Slow EMA {config.slow_ema}, ADX {config.adx_length}/{config.adx_threshold}."
+            f"Switching to timeframe {config.timeframe_minutes}m, Fast EMA {config.ema_fast}, "
+            f"Slow EMA {config.ema_slow}, ADX {config.adx_length}/{config.adx_threshold}."
         )
         self.bars.clear()
         self.current_bar = None
@@ -519,7 +479,7 @@ class EmaAdxBot:
         """Placeholder for push notification when config changes."""
         self.logger.info(
             "[PUSH] New weekly config -> "
-            f"TF={config.timeframe_minutes}m, Fast={config.fast_ema}, Slow={config.slow_ema}, "
+            f"TF={config.timeframe_minutes}m, Fast={config.ema_fast}, Slow={config.ema_slow}, "
             f"ADX={config.adx_length}/{config.adx_threshold}, "
             f"PnL={metrics['net_pnl']:.2f}, DD={metrics['max_drawdown']:.2f}, Sharpe={metrics['sharpe']:.2f}"
         )
@@ -528,37 +488,55 @@ class EmaAdxBot:
     # Utilities
     # -------------------------
     def _compute_position_size(self, price: float) -> int:
+        equity = self._current_equity(price)
+        if equity <= 0:
+            self.logger.warning("Unable to fetch account equity; defaulting quantity to 0.")
+            return 0
+        value = equity * (self.config.position_size_pct / 100)
+        qty = int(value // price)
+        return max(qty, 0)
+
+    def _current_equity(self, last_price: float) -> float:
         account = self.ib.accountSummary()
         net_liq = 0.0
         for row in account:
             if row.tag == "NetLiquidation" and row.currency == CURRENCY:
                 net_liq = float(row.value)
                 break
-        if net_liq <= 0:
-            self.logger.warning("Unable to fetch account equity; defaulting quantity to 0.")
-            return 0
-        value = net_liq * (self.config.position_size_pct / 100)
-        qty = int(value // price)
-        return max(qty, 0)
+        if self.state.position_qty:
+            return net_liq if net_liq else self.state.cash + self.state.position_qty * last_price
+        return net_liq if net_liq else self.state.cash
 
     def _refresh_position_state(self) -> None:
         positions = self.ib.positions()
+        active = None
         for pos in positions:
             if pos.contract.conId == self.contract.conId or (
                 pos.contract.symbol == self.contract.symbol and pos.contract.exchange == self.contract.exchange
             ):
-                if pos.position > 0:
-                    self.position_side = "long"
-                elif pos.position < 0:
-                    self.position_side = "short"
-                else:
-                    self.position_side = "flat"
-                self.entry_price = pos.avgCost
-                self.high_since_entry = self.entry_price
-                self.low_since_entry = self.entry_price
-                self._sync_open_stop()
-                return
+                active = pos
+                break
+
+        last_price = self.bars[-1].close if self.bars else 0
+        if active:
+            qty = int(active.position)
+            self.state.position_qty = qty
+            self.state.position_side = 1 if qty > 0 else -1 if qty < 0 else 0
+            self.state.entry_price = active.avgCost if qty != 0 else None
+            self.state.high_since_entry = self.state.entry_price
+            self.state.low_since_entry = self.state.entry_price
+            equity = self._current_equity(last_price)
+            self.state.cash = equity - qty * last_price
+            self.position_side = "long" if qty > 0 else "short" if qty < 0 else "flat"
+            self.entry_price = active.avgCost
+            self._sync_open_stop()
+            return
+
+        self.state.position_qty = 0
+        self.state.position_side = 0
+        self.state.entry_price = None
         self.position_side = "flat"
+        self.state.cash = self._current_equity(last_price)
         self.stop_order = None
 
     def _current_position_size(self) -> float:

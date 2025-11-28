@@ -202,7 +202,7 @@ def _resample_dataframe(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFram
     return agg
 
 
-def get_resampled_bars(timeframe_minutes: int, lookback_days: int = 120) -> pd.DataFrame:
+def get_resampled_bars(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
     """Return cached/resampled bars for the requested timeframe."""
     hourly_df = _hourly_dataframe(lookback_days)
     if timeframe_minutes == 60:
