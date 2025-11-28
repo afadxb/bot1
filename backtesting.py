@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from config import StrategyConfig
+from config import CURRENCY, EXCHANGE, StrategyConfig
 from data_cache import fetch_historical_dataframe as cache_fetch_historical_dataframe
 
 
@@ -76,9 +76,22 @@ def compute_ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 
-def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
+def fetch_historical_dataframe(
+    timeframe_minutes: int,
+    lookback_days: int,
+    *,
+    symbol: str,
+    exchange: str,
+    currency: str,
+) -> pd.DataFrame:
     """Fetch historical bars from cache (hourly base) and resample as needed."""
-    return cache_fetch_historical_dataframe(timeframe_minutes, lookback_days)
+    return cache_fetch_historical_dataframe(
+        timeframe_minutes,
+        lookback_days,
+        symbol=symbol,
+        exchange=exchange,
+        currency=currency,
+    )
 
 
 def ib_bar_size_setting(timeframe_minutes: int) -> str:
@@ -246,7 +259,13 @@ def backtest_strategy(
 def run_basic_test() -> None:
     """Simple test entry point to compare against TradingView defaults."""
     cfg = StrategyConfig()
-    df = fetch_historical_dataframe(cfg.timeframe_minutes, cfg.lookback_days)
+    df = fetch_historical_dataframe(
+        cfg.timeframe_minutes,
+        cfg.lookback_days,
+        symbol=cfg.symbol,
+        exchange=EXCHANGE,
+        currency=CURRENCY,
+    )
     metrics = backtest_strategy(df, cfg)
     start_date = df["time"].iloc[0] if not df.empty else None
     end_date = df["time"].iloc[-1] if not df.empty else None

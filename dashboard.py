@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from backtesting import backtest_strategy
-from config import StrategyConfig, load_config, save_config
+from config import CURRENCY, EXCHANGE, StrategyConfig, load_config, save_config
 from data_cache import fetch_historical_dataframe
 
 
@@ -139,7 +139,13 @@ def main() -> None:
 
     st.title("Backtest Output")
 
-    df = fetch_historical_dataframe(cfg.timeframe_minutes, cfg.lookback_days)
+    df = fetch_historical_dataframe(
+        cfg.timeframe_minutes,
+        cfg.lookback_days,
+        symbol=cfg.symbol,
+        exchange=EXCHANGE,
+        currency=CURRENCY,
+    )
     if df is None or df.empty:
         st.warning("No historical data available for the requested parameters.")
         return

@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from backtesting import backtest_strategy, fetch_historical_dataframe, rank_better
-from config import StrategyConfig, load_config
+from config import CURRENCY, EXCHANGE, StrategyConfig, load_config
 
 
 _TIMEFRAMES = [60, 120, 180, 240]
@@ -26,7 +26,13 @@ def run_weekly_optimization_once(
 
     bars_cache: Dict[int, pd.DataFrame] = {}
     for tf in _TIMEFRAMES:
-        bars_cache[tf] = fetch_historical_dataframe(tf, current_config.lookback_days)
+        bars_cache[tf] = fetch_historical_dataframe(
+            tf,
+            current_config.lookback_days,
+            symbol=current_config.symbol,
+            exchange=EXCHANGE,
+            currency=CURRENCY,
+        )
 
     best_config: Optional[StrategyConfig] = None
     best_metrics: Optional[Dict[str, float]] = None
