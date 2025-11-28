@@ -15,6 +15,39 @@ CACHE_TTL = dt.timedelta(hours=1)
 DB_PATH = Path("data_cache.sqlite")
 logger = logging.getLogger(__name__)
 
+
+def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a normalized OHLCV frame with lowercase columns and a time column.
+
+    This helper attempts to be resilient to data from external sources that may
+    arrive with differently cased column names or with a DateTimeIndex. When
+    required columns are missing, an empty DataFrame is returned to avoid
+    downstream KeyErrors during resampling.
+    """
+
+    if df.empty:
+        return df
+
+    normalized = df.copy()
+    normalized = normalized.rename(columns={col: str(col).lower() for col in normalized.columns})
+
+    if "time" not in normalized.columns:
+        normalized = normalized.reset_index()
+        normalized = normalized.rename(columns={col: str(col).lower() for col in normalized.columns})
+        if "time" not in normalized.columns and "index" in normalized.columns:
+            normalized = normalized.rename(columns={"index": "time"})
+
+    required_cols = {"time", "open", "high", "low", "close", "volume"}
+    missing = required_cols - set(normalized.columns)
+    if missing:
+        logger.warning("Dropping dataframe missing required OHLCV columns: %s", sorted(missing))
+        return pd.DataFrame(columns=sorted(required_cols))
+
+    normalized["time"] = pd.to_datetime(normalized["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
+    normalized = normalized.dropna(subset=["time"])
+
+    return normalized[["time", "open", "high", "low", "close", "volume"]]
+
 def _to_naive_utc(ts: dt.datetime) -> dt.datetime:
     """Normalize timestamps to naive UTC for consistent storage/processing."""
     if ts.tzinfo:
@@ -99,11 +132,9 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, ex
     if df.empty:
         return
 
-    normalized = df.copy()
-    if "time" not in normalized.columns:
-        normalized = normalized.reset_index()
-        if "time" not in normalized.columns and "index" in normalized.columns:
-            normalized = normalized.rename(columns={"index": "time"})
+    normalized = _normalize_ohlcv_frame(df)
+    if normalized.empty:
+        return
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     records = [
@@ -232,11 +263,11 @@ def _hourly_dataframe(lookback_days: int, symbol: str, exchange: str, currency: 
 
 
 def _resample_dataframe(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
-    if df.empty:
-        return df
-    indexed = df.copy()
-    indexed["time"] = pd.to_datetime(indexed["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
-    indexed = indexed.sort_values("time").set_index("time")
+    normalized = _normalize_ohlcv_frame(df)
+    if normalized.empty:
+        return normalized
+
+    indexed = normalized.sort_values("time").set_index("time")
     rule = f"{timeframe_minutes}T"
     agg = indexed.resample(rule, label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
