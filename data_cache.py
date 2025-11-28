@@ -2,17 +2,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from ib_insync import Contract, IB, Stock
 
 from config import CLIENT_ID, CURRENCY, EXCHANGE, HOST, PORT, SYMBOL
 
 CACHE_TTL = dt.timedelta(hours=1)
 DB_PATH = Path("data_cache.sqlite")
+logger = logging.getLogger(__name__)
 
 def _to_naive_utc(ts: dt.datetime) -> dt.datetime:
     """Normalize timestamps to naive UTC for consistent storage/processing."""
@@ -139,6 +140,12 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame) -> None:
 
 
 def _fetch_hourly_from_ib(lookback_days: int) -> pd.DataFrame:
+    """Lazy-import ib_insync to avoid event loop creation when unused."""
+    try:
+        from ib_insync import Contract, IB, Stock
+    except Exception as exc:  # pragma: no cover - defensive import path
+        raise RuntimeError("ib_insync is required for IBKR data fetching") from exc
+
     ib = IB()
     try:
         ib.connect(HOST, PORT, clientId=CLIENT_ID + 200, timeout=5)
@@ -175,7 +182,11 @@ def _fetch_hourly_from_ib(lookback_days: int) -> pd.DataFrame:
 def _hourly_dataframe(lookback_days: int) -> pd.DataFrame:
     base_df = _read_cached_bars(60)
     if base_df is None:
-        base_df = _fetch_hourly_from_ib(lookback_days)
+        try:
+            base_df = _fetch_hourly_from_ib(lookback_days)
+        except RuntimeError as exc:
+            logger.warning("Unable to fetch hourly data from IBKR: %s", exc)
+            base_df = pd.DataFrame()
         if not base_df.empty:
             _write_cached_bars(60, base_df)
 
@@ -208,3 +219,8 @@ def get_resampled_bars(timeframe_minutes: int, lookback_days: int) -> pd.DataFra
     if timeframe_minutes == 60:
         return hourly_df
     return _resample_dataframe(hourly_df, timeframe_minutes)
+
+
+def fetch_historical_dataframe(timeframe_minutes: int, lookback_days: int) -> pd.DataFrame:
+    """Public helper to fetch/resample bars for consumers like backtests and dashboards."""
+    return get_resampled_bars(timeframe_minutes, lookback_days)
