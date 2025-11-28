@@ -15,6 +15,39 @@ CACHE_TTL = dt.timedelta(hours=1)
 DB_PATH = Path("data_cache.sqlite")
 logger = logging.getLogger(__name__)
 
+
+def _normalize_ohlcv_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a normalized OHLCV frame with lowercase columns and a time column.
+
+    This helper attempts to be resilient to data from external sources that may
+    arrive with differently cased column names or with a DateTimeIndex. When
+    required columns are missing, an empty DataFrame is returned to avoid
+    downstream KeyErrors during resampling.
+    """
+
+    if df.empty:
+        return df
+
+    normalized = df.copy()
+    normalized = normalized.rename(columns={col: str(col).lower() for col in normalized.columns})
+
+    if "time" not in normalized.columns:
+        normalized = normalized.reset_index()
+        normalized = normalized.rename(columns={col: str(col).lower() for col in normalized.columns})
+        if "time" not in normalized.columns and "index" in normalized.columns:
+            normalized = normalized.rename(columns={"index": "time"})
+
+    required_cols = {"time", "open", "high", "low", "close", "volume"}
+    missing = required_cols - set(normalized.columns)
+    if missing:
+        logger.warning("Dropping dataframe missing required OHLCV columns: %s", sorted(missing))
+        return pd.DataFrame(columns=sorted(required_cols))
+
+    normalized["time"] = pd.to_datetime(normalized["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
+    normalized = normalized.dropna(subset=["time"])
+
+    return normalized[["time", "open", "high", "low", "close", "volume"]]
+
 def _to_naive_utc(ts: dt.datetime) -> dt.datetime:
     """Normalize timestamps to naive UTC for consistent storage/processing."""
     if ts.tzinfo:
@@ -99,6 +132,10 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, ex
     if df.empty:
         return
 
+    normalized = _normalize_ohlcv_frame(df)
+    if normalized.empty:
+        return
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     records = [
         (
@@ -106,14 +143,15 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, ex
             exchange,
             currency,
             timeframe_minutes,
-            row.time.isoformat(),
+            pd.to_datetime(row.time, utc=True, errors="coerce").tz_convert("UTC").tz_localize(None).isoformat(),
             float(row.open),
             float(row.high),
             float(row.low),
             float(row.close),
             float(row.volume),
         )
-        for row in df.itertuples()
+        for row in normalized.itertuples()
+        if getattr(row, "time", None) is not None
     ]
     with sqlite3.connect(DB_PATH) as conn:
         _ensure_tables(conn)
@@ -139,81 +177,102 @@ def _write_cached_bars(timeframe_minutes: int, df: pd.DataFrame, symbol: str, ex
             )
 
 
-def _fetch_hourly_from_ib(lookback_days: int, symbol: str, exchange: str, currency: str) -> pd.DataFrame:
-    """Lazy-import ib_insync to avoid event loop creation when unused."""
-    try:
-        from ib_insync import Contract, IB, Stock
-    except Exception as exc:  # pragma: no cover - defensive import path
-        raise RuntimeError("ib_insync is required for IBKR data fetching") from exc
+def _ib_bar_size_from_minutes(timeframe_minutes: int) -> str:
+    """Convert a minute-based timeframe into an IBKR bar size string."""
+
+    valid_minute_sizes = {1, 2, 3, 5, 10, 15, 20, 30}
+    valid_hour_sizes = {1, 2, 3, 4, 8}
+
+    if timeframe_minutes in valid_minute_sizes:
+        unit = "min" if timeframe_minutes == 1 else "mins"
+        return f"{timeframe_minutes} {unit}"
+
+    if timeframe_minutes % 60 == 0:
+        hours = timeframe_minutes // 60
+        if hours in valid_hour_sizes:
+            unit = "hour" if hours == 1 else "hours"
+            return f"{hours} {unit}"
+
+    raise ValueError(f"Unsupported timeframe for IBKR historical data: {timeframe_minutes} minutes")
+
+
+def _fetch_from_ib(timeframe_minutes: int, lookback_days: int, symbol: str, exchange: str, currency: str) -> pd.DataFrame:
+    """Fetch bars from IBKR using the configured timeframe in compliant chunks."""
+
+    from ib_insync import Contract, IB, Stock
 
     ib = IB()
     try:
-        ib.connect(HOST, PORT, clientId=CLIENT_ID + 200, timeout=5)
+        ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=5)
         contract: Contract = Stock(symbol, exchange, currency)
         ib.qualifyContracts(contract)
-        bars = ib.reqHistoricalData(
-            contract,
-            endDateTime="",
-            durationStr=f"{lookback_days} D",
-            barSizeSetting="1 hour",
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-        )
+
+        earliest_allowed = dt.datetime.utcnow() - dt.timedelta(days=lookback_days)
+        end_dt = dt.datetime.utcnow()
+        chunk_days = 365
         rows = []
-        for b in bars:
-            raw_ts = b.date if isinstance(b.date, dt.datetime) else dt.datetime.strptime(b.date, "%Y%m%d %H:%M:%S")
-            ts = _to_naive_utc(raw_ts)
-            rows.append(
-                {
-                    "time": ts,
-                    "open": b.open,
-                    "high": b.high,
-                    "low": b.low,
-                    "close": b.close,
-                    "volume": b.volume,
-                }
+        bar_size = _ib_bar_size_from_minutes(timeframe_minutes)
+
+        while end_dt > earliest_allowed:
+            remaining_days = (end_dt - earliest_allowed).days or 1
+            duration = min(remaining_days, chunk_days)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime=end_dt,
+                durationStr=f"{duration} D",
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
             )
-        return pd.DataFrame(rows)
+            if not bars:
+                break
+
+            chunk_times = []
+            for bar in bars:
+                raw_ts = bar.date if isinstance(bar.date, dt.datetime) else dt.datetime.strptime(bar.date, "%Y%m%d %H:%M:%S")
+                ts = _to_naive_utc(raw_ts)
+                chunk_times.append(ts)
+                rows.append(
+                    {
+                        "time": ts,
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "volume": bar.volume,
+                    }
+                )
+
+            if not chunk_times:
+                break
+
+            oldest_ts = min(chunk_times)
+            end_dt = oldest_ts - dt.timedelta(seconds=1)
+
+            if oldest_ts <= earliest_allowed:
+                break
+
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+
+        frame = frame.drop_duplicates(subset=["time"]).sort_values("time")
+        return frame[frame["time"] >= earliest_allowed]
     finally:
         ib.disconnect()
 
 
-def _fetch_hourly_from_yfinance(lookback_days: int, symbol: str) -> pd.DataFrame:
-    """Fallback hourly fetch using yfinance when IBKR is unavailable."""
-    try:
-        import yfinance as yf
-    except Exception as exc:  # pragma: no cover - optional dependency
-        logger.warning("yfinance not available for fallback data: %s", exc)
-        return pd.DataFrame()
-
-    period_days = min(lookback_days, 730)  # yfinance caps at ~730 days for 60m interval
-    try:
-        raw = yf.download(symbol, period=f"{period_days}d", interval="60m", progress=False)
-    except Exception as exc:  # pragma: no cover - network errors
-        logger.warning("yfinance download failed: %s", exc)
-        return pd.DataFrame()
-
-    if raw.empty:
-        return pd.DataFrame()
-
-    raw = raw.reset_index().rename(
-        columns={"Datetime": "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
-    )
-    raw["time"] = pd.to_datetime(raw["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
-    return raw[["time", "open", "high", "low", "close", "volume"]]
-
-
-def _hourly_dataframe(lookback_days: int, symbol: str, exchange: str, currency: str) -> pd.DataFrame:
-    base_df = _read_cached_bars(60, symbol, exchange, currency)
+def _timeframe_dataframe(timeframe_minutes: int, lookback_days: int, symbol: str, exchange: str, currency: str) -> pd.DataFrame:
+    base_df = _read_cached_bars(timeframe_minutes, symbol, exchange, currency)
     if base_df is None:
         try:
-            base_df = _fetch_hourly_from_ib(lookback_days, symbol, exchange, currency)
-        except RuntimeError as exc:
-            logger.warning("Unable to fetch hourly data from IBKR: %s", exc)
-            base_df = _fetch_hourly_from_yfinance(lookback_days, symbol)
+            base_df = _fetch_from_ib(timeframe_minutes, lookback_days, symbol, exchange, currency)
+        except Exception as exc:
+            logger.warning("Unable to fetch %s-minute data from IBKR: %s", timeframe_minutes, exc)
+            base_df = pd.DataFrame()
         if not base_df.empty:
-            _write_cached_bars(60, base_df, symbol, exchange, currency)
+            _write_cached_bars(timeframe_minutes, base_df, symbol, exchange, currency)
 
     if base_df is None:
         return pd.DataFrame()
@@ -225,11 +284,11 @@ def _hourly_dataframe(lookback_days: int, symbol: str, exchange: str, currency: 
 
 
 def _resample_dataframe(df: pd.DataFrame, timeframe_minutes: int) -> pd.DataFrame:
-    if df.empty:
-        return df
-    indexed = df.copy()
-    indexed["time"] = pd.to_datetime(indexed["time"], utc=True, errors="coerce").dt.tz_convert("UTC").dt.tz_localize(None)
-    indexed = indexed.sort_values("time").set_index("time")
+    normalized = _normalize_ohlcv_frame(df)
+    if normalized.empty:
+        return normalized
+
+    indexed = normalized.sort_values("time").set_index("time")
     rule = f"{timeframe_minutes}T"
     agg = indexed.resample(rule, label="left", closed="left").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
@@ -246,9 +305,11 @@ def get_resampled_bars(
     currency: str = CURRENCY,
 ) -> pd.DataFrame:
     """Return cached/resampled bars for the requested timeframe."""
-    hourly_df = _hourly_dataframe(lookback_days, symbol, exchange, currency)
-    if timeframe_minutes == 60:
-        return hourly_df
+    timeframe_df = _timeframe_dataframe(timeframe_minutes, lookback_days, symbol, exchange, currency)
+    if not timeframe_df.empty or timeframe_minutes == 60:
+        return timeframe_df
+
+    hourly_df = _timeframe_dataframe(60, lookback_days, symbol, exchange, currency)
     return _resample_dataframe(hourly_df, timeframe_minutes)
 
 
